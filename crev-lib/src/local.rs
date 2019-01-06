@@ -19,7 +19,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs,
-    io::Write,
+    io::{BufRead, Write},
     path::{Path, PathBuf},
 };
 
@@ -281,8 +281,30 @@ impl Local {
     }
 
     pub fn init_readme_using_this_repo_file(&self) -> Result<()> {
+        const README_MARKER_V0: &str = "CREV_README_MARKER_V0";
+
         let proof_dir = self.get_proofs_dir_path()?;
-        std::fs::write(proof_dir.join("README.md"), &include_bytes!("../rc/doc/README.md")[..])?;
+        let path = proof_dir.join("README.md");
+        if path.exists() {
+            if let Some(line) = std::io::BufReader::new(std::fs::File::open(&path)?)
+                .lines()
+                .into_iter()
+                .filter(|line| {
+                    if let Ok(ref line) = line {
+                        line.trim() != ""
+                    } else {
+                        true
+                    }
+                })
+                .next()
+            {
+                if line?.contains(README_MARKER_V0) {
+                    return Ok(());
+                }
+            }
+        }
+
+        std::fs::write(path, &include_bytes!("../rc/doc/README.md")[..])?;
         self.proof_dir_git_add_path(Path::new("README.md"))?;
         Ok(())
     }
