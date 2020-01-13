@@ -1,14 +1,12 @@
-use crate::{id, proof, Result};
-use chrono::{self, prelude::*};
-use crev_common;
-use serde_yaml;
+use crate::{proof, serde_content_serialize, serde_draft_serialize, Result};
+use crev_common::{
+    self,
+    serde::{as_base64, from_base64},
+};
+use derive_builder::Builder;
+use proof::{CommonOps, Content};
+use serde::{Deserialize, Serialize};
 use std::{self, default::Default, fmt, path::PathBuf};
-
-use crev_common::serde::{as_base64, as_rfc3339_fixed, from_base64, from_rfc3339_fixed};
-
-const BEGIN_BLOCK: &str = "-----BEGIN CODE REVIEW-----";
-const BEGIN_SIGNATURE: &str = "-----BEGIN CODE REVIEW SIGNATURE-----";
-const END_BLOCK: &str = "-----END CODE REVIEW-----";
 
 const CURRENT_CODE_REVIEW_PROOF_SERIALIZATION_VERSION: i64 = -1;
 
@@ -34,23 +32,16 @@ pub struct File {
 // TODO: validate setters(no newlines, etc)
 // TODO: https://github.com/colin-kiegel/rust-derive-builder/issues/136
 pub struct Code {
-    #[builder(default = "cur_version()")]
-    version: i64,
-    #[builder(default = "crev_common::now()")]
-    #[serde(
-        serialize_with = "as_rfc3339_fixed",
-        deserialize_with = "from_rfc3339_fixed"
-    )]
-    date: chrono::DateTime<FixedOffset>,
-    pub from: crate::PubId,
+    #[serde(flatten)]
+    pub common: proof::Common,
     #[serde(rename = "package")]
     pub package: proof::PackageInfo,
     #[serde(flatten)]
     #[builder(default = "Default::default()")]
-    review: super::Review,
+    pub review: super::Review,
     #[serde(skip_serializing_if = "String::is_empty", default = "Default::default")]
     #[builder(default = "Default::default()")]
-    comment: String,
+    pub comment: String,
     #[serde(
         skip_serializing_if = "std::vec::Vec::is_empty",
         default = "std::vec::Vec::new"
@@ -60,85 +51,115 @@ pub struct Code {
 }
 
 impl Code {
-    pub fn apply_draft(&self, draft: CodeDraft) -> Code {
-        let mut copy = self.clone();
-        copy.review = draft.review;
-        copy.comment = draft.comment;
-        copy
+    pub const KIND: &'static str = "code review";
+}
+
+impl CodeBuilder {
+    pub fn from<VALUE: Into<crate::PubId>>(&mut self, value: VALUE) -> &mut Self {
+        if let Some(ref mut common) = self.common {
+            common.from = value.into();
+        } else {
+            self.common = Some(proof::Common {
+                kind: Some(Code::KIND.into()),
+                version: cur_version(),
+                date: crev_common::now(),
+                from: value.into(),
+            });
+        }
+        self
+    }
+}
+
+impl proof::CommonOps for Code {
+    fn common(&self) -> &proof::Common {
+        &self.common
+    }
+
+    fn kind(&self) -> &str {
+        // Backfill the `kind` if it is empty (legacy format)
+        self.common
+            .kind
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or(Self::KIND)
+    }
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.serialize_to(f).map_err(|_| fmt::Error)
     }
 }
 
 /// Like `Code` but serializes for interactive editing
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CodeDraft {
+pub struct Draft {
     review: super::Review,
     #[serde(default = "Default::default")]
     comment: String,
 }
 
-impl From<Code> for CodeDraft {
+impl Draft {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(serde_yaml::from_str(&s)?)
+    }
+}
+
+impl From<Code> for Draft {
     fn from(code: Code) -> Self {
-        CodeDraft {
+        Draft {
             review: code.review,
             comment: code.comment,
         }
     }
 }
 
-impl Code {
-    pub(crate) const BEGIN_BLOCK: &'static str = BEGIN_BLOCK;
-    pub(crate) const BEGIN_SIGNATURE: &'static str = BEGIN_SIGNATURE;
-    pub(crate) const END_BLOCK: &'static str = END_BLOCK;
-}
-
-impl proof::ContentCommon for Code {
-    fn date(&self) -> &chrono::DateTime<FixedOffset> {
-        &self.date
-    }
-    fn author(&self) -> &crate::PubId {
-        &self.from
-    }
-
-    fn draft_title(&self) -> String {
-        format!(
-            "Code Review of {} files of {} {}",
-            self.files.len(),
-            self.package.name,
-            self.package.version
-        )
-    }
-}
-
-impl super::Common for Code {
+impl proof::WithReview for Code {
     fn review(&self) -> &super::Review {
         &self.review
     }
 }
 
-impl Code {
-    pub fn parse(s: &str) -> Result<Self> {
-        Ok(serde_yaml::from_str(&s)?)
+impl proof::content::Content for Code {
+    fn validate_data(&self) -> Result<()> {
+        self.ensure_kind_is(Code::KIND)?;
+        Ok(())
     }
 
-    pub fn sign_by(self, id: &id::OwnId) -> Result<proof::Proof> {
-        proof::Content::from(self).sign_by(id)
-    }
-}
-
-impl CodeDraft {
-    pub fn parse(s: &str) -> Result<Self> {
-        Ok(serde_yaml::from_str(&s)?)
+    fn serialize_to(&self, fmt: &mut dyn std::fmt::Write) -> Result<()> {
+        serde_content_serialize!(self, fmt);
+        Ok(())
     }
 }
 
-impl fmt::Display for Code {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        crev_common::serde::write_as_headerless_yaml(self, f)
+impl proof::ContentWithDraft for Code {
+    fn to_draft(&self) -> proof::Draft {
+        proof::Draft {
+            title: format!(
+                "Code Review of {} files of {} {}",
+                self.files.len(),
+                self.package.id.id.name,
+                self.package.id.version
+            ),
+            body: Draft::from(self.clone()).to_string(),
+        }
+    }
+
+    fn apply_draft(&self, s: &str) -> Result<Self> {
+        let draft = Draft::parse(&s)?;
+
+        let mut copy = self.clone();
+        copy.review = draft.review;
+        copy.comment = draft.comment;
+
+        copy.validate_data()?;
+        Ok(copy)
     }
 }
 
-impl fmt::Display for CodeDraft {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        crev_common::serde::write_as_headerless_yaml(self, f)
+impl fmt::Display for Draft {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        serde_draft_serialize!(self, fmt);
+        Ok(())
     }
 }

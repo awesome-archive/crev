@@ -1,9 +1,11 @@
 use crev_recursive_digest::DigestError;
 use digest::Digest;
-use std::collections::HashSet;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tempdir::TempDir;
 
 #[test]
@@ -86,7 +88,11 @@ pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> std::io::
 /// ln -sf /tmp/a/b/c/d/e/f/g/h "../../a"
 /// rblake2sum /tmp/a
 /// ```
+///
+/// Ignored by default on Windows, as users typically cannot create symlinks
+/// without running as admin.
 #[test]
+#[cfg_attr(target_family = "windows", ignore)]
 fn backward_comp() -> Result<(), DigestError> {
     let tmp_dir = TempDir::new("recursive-digest-test2")?;
 
@@ -165,7 +171,7 @@ fn test_exclude_include_path() -> Result<(), DigestError> {
         let file_sum = hasher.result().to_vec();
 
         let mut hasher = blake2::Blake2b::new();
-        hasher.input("bar".as_bytes());
+        hasher.input(b"bar");
         let dir_sum = hasher.result().to_vec();
 
         let mut hasher = blake2::Blake2b::new();

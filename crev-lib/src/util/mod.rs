@@ -2,13 +2,15 @@ pub mod git;
 
 use crate::prelude::*;
 use crev_common;
-use crev_data::proof;
+use crev_data::proof::{self, ContentExt};
+use failure::bail;
 use git2;
-use std::fmt::Write as FmtWrite;
-use std::{self, env, ffi, fs, io::Write, path::Path, process};
+use std::{self, env, ffi, fmt::Write as FmtWrite, fs, io, io::Write, path::Path};
 use tempdir;
 
-pub use crev_common::{read_file_to_string, store_str_to_file, store_to_file_with};
+pub use crev_common::{
+    read_file_to_string, run_with_shell_cmd, store_str_to_file, store_to_file_with,
+};
 
 fn get_git_default_editor() -> Result<String> {
     let cfg = git2::Config::open_default()?;
@@ -27,7 +29,8 @@ fn get_editor_to_use() -> Result<ffi::OsString> {
     })
 }
 
-fn edit_text_iteractively(text: &str) -> Result<String> {
+/// Retruns the edited string, and bool indicating if the file was ever written to/ (saved).
+fn edit_text_iteractively_raw(text: &str) -> Result<(String, bool)> {
     let dir = tempdir::TempDir::new("crev")?;
     let file_path = dir.path().join("crev.review");
     let mut file = fs::File::create(&file_path)?;
@@ -35,34 +38,42 @@ fn edit_text_iteractively(text: &str) -> Result<String> {
     file.flush()?;
     drop(file);
 
+    let starting_ts = std::fs::metadata(&file_path)?
+        .modified()
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+
     edit_file(&file_path)?;
 
-    Ok(read_file_to_string(&file_path)?)
+    let modified_ts = std::fs::metadata(&file_path)?
+        .modified()
+        .unwrap_or_else(|_| std::time::SystemTime::now());
+
+    Ok((read_file_to_string(&file_path)?, starting_ts != modified_ts))
+}
+
+pub fn edit_text_iteractively(text: &str) -> Result<String> {
+    Ok(edit_text_iteractively_raw(text)?.0)
+}
+
+pub fn edit_text_iteractively_until_writen_to(text: &str) -> Result<String> {
+    loop {
+        let (text, modified) = edit_text_iteractively_raw(text)?;
+        if !modified {
+            eprintln!(
+                "File not written to. Make sure to save it at least once to confirm the data."
+            );
+            crev_common::try_again_or_cancel()?;
+            continue;
+        }
+
+        return Ok(text);
+    }
 }
 
 pub fn edit_file(path: &Path) -> Result<()> {
     let editor = get_editor_to_use()?;
 
-    let status = if cfg!(windows) {
-        let mut proc = process::Command::new(editor.clone());
-        proc.arg(path);
-        proc
-    } else if cfg!(unix) {
-        let mut proc = process::Command::new("/bin/sh");
-        proc.arg("-c").arg(format!(
-            "{} {}",
-            editor
-                .clone()
-                .into_string()
-                .map_err(|_| format_err!("$EDITOR or $VISUAL not a valid Unicode"))?,
-            shell_escape::escape(path.display().to_string().into())
-        ));
-        proc
-    } else {
-        panic!("What platform are you running this on? Please submit a PR!");
-    }
-    .status()
-    .with_context(|_e| format_err!("Couldn't start the editor: {}", editor.to_string_lossy()))?;
+    let status = run_with_shell_cmd(editor, Some(path))?;
 
     if !status.success() {
         bail!("Editor returned {}", status);
@@ -70,44 +81,75 @@ pub fn edit_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn get_documentation_for(content: &proof::Content) -> &'static str {
-    use crev_data::proof::Content;
-    match content {
-        Content::Trust(_) => include_str!("../../rc/doc/editing-trust.md"),
-        Content::Code(_) => include_str!("../../rc/doc/editing-code-review.md"),
-        Content::Package(_) => include_str!("../../rc/doc/editing-package-review.md"),
+pub fn get_documentation_for(content: &impl proof::Content) -> &'static str {
+    match content.kind() {
+        proof::Trust::KIND => include_str!("../../rc/doc/editing-trust.md"),
+        proof::CodeReview::KIND => include_str!("../../rc/doc/editing-code-review.md"),
+        proof::PackageReview::KIND => include_str!("../../rc/doc/editing-package-review.md"),
+        _ => "unknown proof type",
     }
 }
 
-pub fn edit_proof_content_iteractively(content: &proof::Content) -> Result<proof::Content> {
+pub fn edit_proof_content_iteractively<C: proof::ContentWithDraft>(
+    content: &C,
+    previous_date: Option<&proof::Date>,
+    base_version: Option<&semver::Version>,
+) -> Result<C> {
     let mut text = String::new();
+    if let Some(date) = previous_date {
+        text.write_str(&format!(
+            "# Overwriting existing proof created on {}\n",
+            date.to_rfc3339()
+        ))?;
+    }
+    let draft = content.to_draft();
 
-    text.write_str(&format!("# {}\n", content.draft_title()))?;
-    text.write_str(&content.to_draft_string())?;
+    text.write_str(&format!("# {}\n", draft.title()))?;
+    if let Some(base_version) = base_version {
+        text.write_str(&format!("# Diff base version: {}\n", base_version))?;
+    }
+    text.write_str(&draft.body())?;
     text.write_str("\n\n")?;
     for line in get_documentation_for(content).lines() {
         text.write_fmt(format_args!("# {}\n", line))?;
     }
     loop {
-        text = edit_text_iteractively(&text)?;
-        match proof::Content::parse_draft(content, &text) {
+        text = edit_text_iteractively_until_writen_to(&text)?;
+        match content.apply_draft(&text) {
             Err(e) => {
                 eprintln!("There was an error parsing content: {}", e);
-                if !crev_common::yes_or_no_was_y("Try again (y/n) ")? {
-                    bail!("User canceled");
+                crev_common::try_again_or_cancel()?;
+            }
+            Ok(content) => {
+                if let Err(e) = content.ensure_serializes_to_valid_proof() {
+                    eprintln!("There was an error validating serialized proof: {}", e);
+                    crev_common::try_again_or_cancel()?;
+                } else {
+                    return Ok(content);
                 }
             }
-            Ok(content) => return Ok(content),
         }
     }
 }
 
-pub fn err_eprint_and_ignore<O, E: std::error::Error>(res: std::result::Result<O, E>) -> bool {
+pub fn err_eprint_and_ignore<O, E: std::error::Error>(res: std::result::Result<O, E>) -> Option<O> {
     match res {
         Err(e) => {
             eprintln!("{}", e);
-            false
+            None
         }
-        Ok(_) => true,
+        Ok(o) => Some(o),
     }
+}
+
+#[cfg(target_family = "unix")]
+pub fn chmod_path_to_600(path: &Path) -> io::Result<()> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    std::fs::set_permissions(path, Permissions::from_mode(0o600))
+}
+
+#[cfg(not(target_family = "unix"))]
+pub fn chmod_path_to_600(path: &Path) -> io::Result<()> {
+    Ok(())
 }

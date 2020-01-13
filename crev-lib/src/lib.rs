@@ -1,10 +1,6 @@
-#[macro_use]
-extern crate serde_derive;
-extern crate term;
+#![type_length_limit = "10709970"]
 
-#[macro_use]
-extern crate failure;
-
+pub mod activity;
 pub mod id;
 pub mod local;
 pub(crate) mod prelude;
@@ -14,9 +10,9 @@ pub mod repo;
 pub mod staging;
 pub mod util;
 
-use crate::prelude::*;
-use crate::proofdb::TrustSet;
+use crate::{prelude::*, proofdb::TrustSet};
 use crev_data::Digest;
+use failure::format_err;
 use std::{
     collections::HashSet,
     fmt,
@@ -25,6 +21,7 @@ use std::{
 
 pub use self::local::Local;
 pub use crate::proofdb::{ProofDB, TrustDistanceParams};
+pub use activity::{ReviewActivity, ReviewMode};
 
 /// Trait representing a place that can keep proofs
 ///
@@ -34,72 +31,86 @@ pub trait ProofStore {
     fn proofs_iter(&self) -> Result<Box<dyn Iterator<Item = crev_data::proof::Proof>>>;
 }
 
-#[derive(Copy, Clone)]
-pub enum TrustOrDistrust {
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum TrustProofType {
     Trust,
+    Untrust,
     Distrust,
 }
 
-impl fmt::Display for TrustOrDistrust {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl fmt::Display for TrustProofType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TrustOrDistrust::Trust => f.write_str("trust"),
-            TrustOrDistrust::Distrust => f.write_str("distrust"),
+            TrustProofType::Trust => f.write_str("trust"),
+            TrustProofType::Distrust => f.write_str("distrust"),
+            TrustProofType::Untrust => f.write_str("untrust"),
         }
     }
 }
 
-impl TrustOrDistrust {
+impl TrustProofType {
     pub fn is_trust(self) -> bool {
-        if let TrustOrDistrust::Trust = self {
+        if let TrustProofType::Trust = self {
             return true;
         }
         false
     }
 
     pub fn to_review(self) -> crev_data::Review {
-        use self::TrustOrDistrust::*;
+        use self::TrustProofType::*;
         match self {
             Trust => crev_data::Review::new_positive(),
             Distrust => crev_data::Review::new_negative(),
+            Untrust => crev_data::Review::new_none(),
         }
     }
 }
 
+/// Verification requirements
+#[derive(Clone, Debug)]
+pub struct VerificationRequirements {
+    pub trust_level: crev_data::Level,
+    pub understanding: crev_data::Level,
+    pub thoroughness: crev_data::Level,
+    pub redundancy: u64,
+}
+
+impl Default for VerificationRequirements {
+    fn default() -> Self {
+        VerificationRequirements {
+            trust_level: Default::default(),
+            understanding: Default::default(),
+            thoroughness: Default::default(),
+            redundancy: 1,
+        }
+    }
+}
 /// Result of verification
 ///
 /// Not named `Result` to avoid confusion with `Result` type.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub enum VerificationStatus {
-    Verified(crev_data::proof::TrustLevel),
-    Unknown,
-    Flagged,
-    Dangerous,
+    Negative,
+    Insufficient,
+    Verified,
+    Local,
 }
 
 impl VerificationStatus {
-    pub fn is_verified(&self) -> bool {
+    pub fn is_verified(self) -> bool {
         match self {
-            VerificationStatus::Verified(_) => true,
+            VerificationStatus::Verified => true,
             _ => false,
         }
     }
-}
 
-/// Trait for stuff that has a coresponding color somewhere in the "UI"
-//
-// TODO: This has to find some better place than here.
-pub trait Colored {
-    fn color(&self) -> Option<term::color::Color>;
-}
-
-impl Colored for VerificationStatus {
-    fn color(&self) -> Option<term::color::Color> {
-        match *self {
-            VerificationStatus::Verified(_) => Some(term::color::GREEN),
-            VerificationStatus::Flagged => Some(term::color::YELLOW),
-            VerificationStatus::Dangerous => Some(term::color::RED),
-            _ => None,
+    pub fn min(self, other: Self) -> Self {
+        if self < other {
+            self
+        } else if other < self {
+            other
+        } else {
+            self
         }
     }
 }
@@ -107,10 +118,10 @@ impl Colored for VerificationStatus {
 impl fmt::Display for VerificationStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerificationStatus::Verified(level) => f.pad(&level.to_string()),
-            VerificationStatus::Unknown => f.pad("unknown"),
-            VerificationStatus::Flagged => f.pad("flagged"),
-            VerificationStatus::Dangerous => f.pad("danger"),
+            VerificationStatus::Local => f.pad("locl"),
+            VerificationStatus::Verified => f.pad("pass"),
+            VerificationStatus::Insufficient => f.pad("none"),
+            VerificationStatus::Negative => f.pad("warn"),
         }
     }
 }
@@ -120,6 +131,7 @@ pub fn dir_or_git_repo_verify<H1>(
     ignore_list: &HashSet<PathBuf, H1>,
     db: &ProofDB,
     trusted_set: &TrustSet,
+    requirements: &VerificationRequirements,
 ) -> Result<crate::VerificationStatus>
 where
     H1: std::hash::BuildHasher + std::default::Default,
@@ -133,7 +145,7 @@ where
         >(path, ignore_list)?)
     };
 
-    Ok(db.verify_package_digest(&digest, trusted_set))
+    Ok(db.verify_package_digest(&digest, trusted_set, requirements))
 }
 
 pub fn dir_verify<H1>(
@@ -141,6 +153,7 @@ pub fn dir_verify<H1>(
     ignore_list: &HashSet<PathBuf, H1>,
     db: &ProofDB,
     trusted_set: &TrustSet,
+    requirements: &VerificationRequirements,
 ) -> Result<crate::VerificationStatus>
 where
     H1: std::hash::BuildHasher + std::default::Default,
@@ -149,7 +162,7 @@ where
         crev_common::Blake2b256,
         H1,
     >(path, ignore_list)?);
-    Ok(db.verify_package_digest(&digest, trusted_set))
+    Ok(db.verify_package_digest(&digest, trusted_set, requirements))
 }
 
 pub fn get_dir_digest<H1>(path: &Path, ignore_list: &HashSet<PathBuf, H1>) -> Result<Digest>

@@ -1,15 +1,24 @@
-use crate::VerificationStatus;
+use crate::{VerificationRequirements, VerificationStatus};
 use chrono::{self, offset::Utc, DateTime};
+use common_failures::Result;
 use crev_data::{
     self,
-    proof::review::Rating,
-    proof::trust::TrustLevel,
-    proof::{self, review, Content, ContentCommon},
-    Digest, Id, Url,
+    proof::{
+        self,
+        review::{self, Rating},
+        trust::TrustLevel,
+        CommonOps, Content,
+    },
+    Digest, Id, Level, Url,
 };
 use default::default;
-use std::collections::BTreeMap;
-use std::collections::{hash_map, BTreeSet, HashMap, HashSet};
+use failure::bail;
+use log::debug;
+use semver::Version;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync,
+};
 
 /// A `T` with a timestamp
 ///
@@ -22,87 +31,168 @@ pub struct Timestamped<T> {
 }
 
 impl<T> Timestamped<T> {
-    fn update_to_more_recent(&mut self, date: &chrono::DateTime<Utc>, value: T) {
-        if self.date < *date {
-            self.value = value;
-        }
-    }
-
-    fn insert_into_or_update_to_more_recent<K>(self, entry: hash_map::Entry<K, Timestamped<T>>) {
-        match entry {
-            hash_map::Entry::Occupied(mut entry) => entry
-                .get_mut()
-                .update_to_more_recent(&self.date, self.value),
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(self);
-            }
+    // Return `trude` if value was updated
+    fn update_to_more_recent(&mut self, other: &Self)
+    where
+        T: Clone,
+    {
+        // in practice it doesn't matter, but in tests
+        // it's convenient to overwrite even if the time
+        // is exactly the same
+        if self.date <= other.date {
+            self.date = other.date;
+            self.value = other.value.clone();
         }
     }
 }
 
+impl<T, Tz> From<(&DateTime<Tz>, T)> for Timestamped<T>
+where
+    Tz: chrono::TimeZone,
+{
+    fn from(from: (&DateTime<Tz>, T)) -> Self {
+        Timestamped {
+            date: from.0.with_timezone(&Utc),
+            value: from.1,
+        }
+    }
+}
+
+pub type Signature = String;
 type TimestampedUrl = Timestamped<Url>;
 type TimestampedTrustLevel = Timestamped<TrustLevel>;
 type TimestampedReview = Timestamped<review::Review>;
+type TimestampedSignature = Timestamped<Signature>;
+type TimestampedFlags = Timestamped<proof::Flags>;
 
 impl From<proof::Trust> for TimestampedTrustLevel {
     fn from(trust: proof::Trust) -> Self {
         TimestampedTrustLevel {
-            date: trust.date().with_timezone(&Utc),
+            date: trust.date_utc(),
             value: trust.trust,
         }
     }
 }
 
-impl<'a, T: review::Common> From<&'a T> for TimestampedReview {
+impl<'a, T: proof::WithReview + Content + CommonOps> From<&'a T> for TimestampedReview {
     fn from(review: &T) -> Self {
         TimestampedReview {
             value: review.review().to_owned(),
-            date: review.date().with_timezone(&Utc),
+            date: review.date_utc(),
         }
     }
 }
 
-/// Unique package review
+/// Unique package review id
 ///
 /// Since package review can be overwritten, it's useful
-/// to refer to a review by an unique combination of
+/// to refer to a review by an unique combination of:
 ///
 /// * author's ID
-/// * source
-/// * crate
-/// * version
+/// * pkg source
+/// * pkg name
+/// * pkg version
 #[derive(Hash, Debug, Clone, PartialEq, Eq)]
-pub struct UniquePackageReview {
+pub struct PkgVersionReviewId {
     from: Id,
-    source: String,
-    name: String,
-    version: String,
+    package_version_id: proof::PackageVersionId,
 }
 
-type TimestampedSignature = Timestamped<String>;
-
-impl From<review::Package> for UniquePackageReview {
+impl From<review::Package> for PkgVersionReviewId {
     fn from(review: review::Package) -> Self {
-        Self {
-            from: review.from.id,
-            source: review.package.source,
-            name: review.package.name,
-            version: review.package.version,
+        PkgVersionReviewId {
+            from: review.from().id.clone(),
+            package_version_id: review.package.id,
         }
     }
 }
 
-impl<Tz> From<(&DateTime<Tz>, String)> for TimestampedSignature
-where
-    Tz: chrono::TimeZone,
-{
-    fn from(args: (&DateTime<Tz>, String)) -> Self {
-        Self {
-            date: args.0.with_timezone(&Utc),
-            value: args.1,
+impl From<&review::Package> for PkgVersionReviewId {
+    fn from(review: &review::Package) -> Self {
+        PkgVersionReviewId {
+            from: review.from().id.to_owned(),
+            package_version_id: review.package.id.clone(),
         }
     }
 }
+
+#[derive(Hash, Debug, Clone, PartialEq, Eq)]
+pub struct PkgReviewId {
+    from: Id,
+    package_id: proof::PackageId,
+}
+impl From<review::Package> for PkgReviewId {
+    fn from(review: review::Package) -> Self {
+        PkgReviewId {
+            from: review.from().id.clone(),
+            package_id: review.package.id.id,
+        }
+    }
+}
+
+impl From<&review::Package> for PkgReviewId {
+    fn from(review: &review::Package) -> Self {
+        PkgReviewId {
+            from: review.from().id.to_owned(),
+            package_id: review.package.id.id.clone(),
+        }
+    }
+}
+
+pub type Source = String;
+pub type Name = String;
+
+/// Alternatives relationship
+///
+/// Derived from the data in the proofs
+#[derive(Default)]
+struct AlternativesData {
+    derived_recalculation_counter: usize,
+    for_pkg: HashMap<proof::PackageId, HashMap<Id, HashSet<proof::PackageId>>>,
+    reported_by: HashMap<(proof::PackageId, proof::PackageId), HashMap<Id, Signature>>,
+}
+
+impl AlternativesData {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    fn wipe(&mut self) {
+        *self = Self::new();
+    }
+
+    fn record_from_proof(&mut self, review: &review::Package, signature: &Signature) {
+        for alternative in &review.alternatives {
+            let a = &review.package.id.id;
+            let b = alternative;
+            let id = &review.from().id;
+            self.for_pkg
+                .entry(a.clone())
+                .or_default()
+                .entry(id.clone())
+                .or_default()
+                .insert(b.clone());
+
+            self.for_pkg
+                .entry(b.clone())
+                .or_default()
+                .entry(id.clone())
+                .or_default()
+                .insert(a.clone());
+
+            self.reported_by
+                .entry((a.clone(), b.clone()))
+                .or_default()
+                .insert(id.clone(), signature.clone());
+
+            self.reported_by
+                .entry((b.clone(), a.clone()))
+                .or_default()
+                .insert(id.clone(), signature.clone());
+        }
+    }
+}
+
 /// In memory database tracking information from proofs
 ///
 /// After population, used for calculating the effcttive trust set, etc.
@@ -112,20 +202,39 @@ where
 /// all the logic here will have to be moved to a real embedded db
 /// of some kind.
 pub struct ProofDB {
-    trust_id_to_id: HashMap<Id, HashMap<Id, TimestampedTrustLevel>>, // who -(trusts)-> whom
+    /// who -(trusts)-> whom
+    trust_id_to_id: HashMap<Id, HashMap<Id, TimestampedTrustLevel>>,
+
     url_by_id: HashMap<Id, TimestampedUrl>,
     url_by_id_secondary: HashMap<Id, TimestampedUrl>,
 
-    package_review_by_signature: HashMap<String, review::Package>,
+    // all reviews are here
+    package_review_by_signature: HashMap<Signature, review::Package>,
 
+    // we can get the to the review through the signature from these two
     package_review_signatures_by_package_digest:
-        HashMap<Vec<u8>, HashMap<UniquePackageReview, TimestampedSignature>>,
-    package_review_signatures_by_unique_package_review:
-        HashMap<UniquePackageReview, TimestampedSignature>,
+        HashMap<Vec<u8>, HashMap<PkgVersionReviewId, TimestampedSignature>>,
+    package_review_signatures_by_pkg_review_id: HashMap<PkgVersionReviewId, TimestampedSignature>,
 
-    package_reviews_by_source: BTreeMap<String, HashSet<UniquePackageReview>>,
-    package_reviews_by_name: BTreeMap<(String, String), HashSet<UniquePackageReview>>,
-    package_reviews_by_version: BTreeMap<(String, String, String), HashSet<UniquePackageReview>>,
+    // pkg_review_id by package information, nicely grouped
+    package_reviews:
+        BTreeMap<Source, BTreeMap<Name, BTreeMap<Version, HashSet<PkgVersionReviewId>>>>,
+
+    package_flags: HashMap<proof::PackageId, HashMap<Id, TimestampedFlags>>,
+
+    // original data about pkg alternatives
+    // for every package_id, we store a map of ids that had alternatives for it,
+    // and a timestamped signature of the proof, so we keep track of only
+    // the newest alternatives list for a `(PackageId, reporting Id)` pair
+    package_alternatives: HashMap<proof::PackageId, HashMap<Id, TimestampedSignature>>,
+
+    // derived data about pkg alternatives
+    // it is hard to keep track of some data when proofs are being added
+    // which can override previously stored information; because of that
+    // we don't keep track of it, until needed, and only then we just lazily
+    // recalculate it
+    insertion_counter: usize,
+    derived_alternatives: sync::RwLock<AlternativesData>,
 }
 
 impl Default for ProofDB {
@@ -135,13 +244,25 @@ impl Default for ProofDB {
             url_by_id: default(),
             url_by_id_secondary: default(),
             package_review_signatures_by_package_digest: default(),
-            package_review_signatures_by_unique_package_review: default(),
+            package_review_signatures_by_pkg_review_id: default(),
             package_review_by_signature: default(),
-            package_reviews_by_source: default(),
-            package_reviews_by_name: default(),
-            package_reviews_by_version: default(),
+            package_reviews: default(),
+            package_alternatives: default(),
+            package_flags: default(),
+
+            insertion_counter: 0,
+            derived_alternatives: sync::RwLock::new(AlternativesData::new()),
         }
     }
+}
+
+#[derive(Default, Debug)]
+pub struct IssueDetails {
+    pub severity: Level,
+    /// Reviews that reported a given issue by `issues` field
+    pub issues: HashSet<PkgVersionReviewId>,
+    /// Reviews that reported a given issue by `advisories` field
+    pub advisories: HashSet<PkgVersionReviewId>,
 }
 
 impl ProofDB {
@@ -149,8 +270,466 @@ impl ProofDB {
         default()
     }
 
+    fn get_derived_alternatives<'s>(&'s self) -> sync::RwLockReadGuard<'s, AlternativesData> {
+        {
+            let read = self.derived_alternatives.read().expect("lock to work");
+
+            if read.derived_recalculation_counter == self.insertion_counter {
+                return read;
+            }
+        }
+
+        {
+            let mut write = self.derived_alternatives.write().expect("lock to work");
+
+            write.wipe();
+
+            for (_, alt) in &self.package_alternatives {
+                for (_, signature) in alt {
+                    write.record_from_proof(
+                        &self.package_review_by_signature[&signature.value],
+                        &signature.value,
+                    );
+                }
+            }
+
+            write.derived_recalculation_counter = self.insertion_counter;
+        }
+
+        self.derived_alternatives.read().expect("lock to work")
+    }
+
+    pub fn get_pkg_alternatives_by_author<'s, 'a>(
+        &'s self,
+        from: &'a Id,
+        pkg_id: &'a proof::PackageId,
+    ) -> HashSet<proof::PackageId> {
+        let from = from.to_owned();
+
+        let alternatives = self.get_derived_alternatives();
+        alternatives
+            .for_pkg
+            .get(pkg_id)
+            .into_iter()
+            .flat_map(move |i| i.get(&from))
+            .flat_map(move |pkg_ids| pkg_ids)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_pkg_alternatives<'s, 'a>(
+        &'s self,
+        pkg_id: &'a proof::PackageId,
+    ) -> HashSet<(Id, proof::PackageId)> {
+        let alternatives = self.get_derived_alternatives();
+
+        alternatives
+            .for_pkg
+            .get(pkg_id)
+            .into_iter()
+            .flat_map(move |i| i.iter())
+            .flat_map(move |(id, pkg_ids)| {
+                pkg_ids.iter().map(move |v| (id.to_owned(), v.to_owned()))
+            })
+            .collect()
+    }
+
+    pub fn get_pkg_flags_by_author<'s, 'a>(
+        &'s self,
+        from: &'a Id,
+        pkg_id: &'a proof::PackageId,
+    ) -> Option<&'s proof::Flags> {
+        let from = from.to_owned();
+        self.package_flags
+            .get(pkg_id)
+            .and_then(move |i| i.get(&from))
+            .map(move |timestampted| &timestampted.value)
+    }
+
+    pub fn get_pkg_flags<'s, 'a>(
+        &'s self,
+        pkg_id: &'a proof::PackageId,
+    ) -> impl Iterator<Item = (&Id, &'s proof::Flags)> {
+        self.package_flags
+            .get(pkg_id)
+            .into_iter()
+            .flat_map(move |i| i.iter())
+            .map(|(id, flags)| (id, &flags.value))
+    }
+
+    pub fn get_pkg_reviews_for_source<'a, 'b>(
+        &'a self,
+        source: &'b str,
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.iter())
+            .flat_map(move |(_, map)| map.iter())
+            .flat_map(|(_, v)| v)
+            .map(move |pkg_review_id| {
+                self.get_pkg_review_by_pkg_review_id(pkg_review_id)
+                    .expect("exists")
+            })
+    }
+
+    pub fn get_pkg_reviews_for_name<'a, 'b, 'c: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.get(name))
+            .flat_map(move |map| map.iter())
+            .flat_map(|(_, v)| v)
+            .map(move |pkg_review_id| {
+                self.get_pkg_review_by_pkg_review_id(pkg_review_id)
+                    .expect("exists")
+            })
+    }
+
+    pub fn get_pkg_reviews_for_version<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        version: &'d Version,
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.get(name))
+            .flat_map(move |map| map.get(version))
+            .flat_map(|v| v)
+            .map(move |pkg_review_id| {
+                self.get_pkg_review_by_pkg_review_id(pkg_review_id)
+                    .expect("exists")
+            })
+    }
+
+    pub fn get_pkg_reviews_gte_version<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        version: &'d Version,
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.get(name))
+            .flat_map(move |map| map.range(version..))
+            .flat_map(move |(_, v)| v)
+            .map(move |pkg_review_id| {
+                self.get_pkg_review_by_pkg_review_id(pkg_review_id)
+                    .expect("exists")
+            })
+    }
+
+    pub fn get_pkg_reviews_lte_version<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        version: &'d Version,
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.get(name))
+            .flat_map(move |map| map.range(..=version))
+            .flat_map(|(_, v)| v)
+            .map(move |pkg_review_id| {
+                self.get_pkg_review_by_pkg_review_id(pkg_review_id)
+                    .expect("exists")
+            })
+    }
+
+    pub fn get_pkg_review_by_pkg_review_id(
+        &self,
+        uniq: &PkgVersionReviewId,
+    ) -> Option<&proof::review::Package> {
+        let signature = &self
+            .package_review_signatures_by_pkg_review_id
+            .get(uniq)?
+            .value;
+        self.package_review_by_signature.get(signature)
+    }
+
+    pub fn get_pkg_review<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        version: &'d Version,
+        id: &Id,
+    ) -> Option<&proof::review::Package> {
+        self.get_pkg_reviews_for_version(source, name, version)
+            .find(|pkg_review| pkg_review.from().id == *id)
+    }
+
+    pub fn get_advisories<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: Option<&'c str>,
+        version: Option<&'d Version>,
+    ) -> impl Iterator<Item = &'a proof::review::Package> + 'a {
+        match (name, version) {
+            (Some(ref name), Some(ref version)) => {
+                Box::new(self.get_advisories_for_version(source, name, version))
+                    as Box<dyn Iterator<Item = _>>
+            }
+
+            (Some(ref name), None) => Box::new(self.get_advisories_for_package(source, name)),
+            (None, None) => Box::new(self.get_advisories_for_source(source)),
+            (None, Some(_)) => panic!("Wrong usage"),
+        }
+    }
+
+    pub fn get_pkg_reviews_with_issues_for<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: Option<&'c str>,
+        version: Option<&'c Version>,
+        trust_set: &'d TrustSet,
+        trust_level_required: TrustLevel,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        match (name, version) {
+            (Some(name), Some(version)) => Box::new(self.get_pkg_reviews_with_issues_for_version(
+                source,
+                name,
+                version,
+                trust_set,
+                trust_level_required,
+            )) as Box<dyn Iterator<Item = _>>,
+            (Some(name), None) => Box::new(self.get_pkg_reviews_with_issues_for_name(
+                source,
+                name,
+                trust_set,
+                trust_level_required,
+            )),
+            (None, None) => Box::new(self.get_pkg_reviews_with_issues_for_source(
+                source,
+                trust_set,
+                trust_level_required,
+            )),
+            (None, Some(_)) => panic!("Wrong usage"),
+        }
+    }
+
+    pub fn get_advisories_for_version<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        version: &'d Version,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.get_pkg_reviews_gte_version(source, name, version)
+            .filter(move |review| review.is_advisory_for(&version))
+    }
+
+    pub fn get_advisories_for_package<'a, 'b, 'c: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.package_reviews
+            .get(source)
+            .into_iter()
+            .flat_map(move |map| map.get(name))
+            .flat_map(move |map| map.iter())
+            .flat_map(|(_, v)| v)
+            .flat_map(move |pkg_review_id| {
+                let review = &self.package_review_by_signature
+                    [&self.package_review_signatures_by_pkg_review_id[pkg_review_id].value];
+
+                if !review.advisories.is_empty() {
+                    Some(review)
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn get_advisories_for_source(
+        &self,
+        source: &str,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.get_pkg_reviews_for_source(source)
+            .filter(|review| !review.advisories.is_empty())
+    }
+
+    /// Get all issues affecting a given package version
+    ///
+    /// Collect a map of Issue ID -> `IssueReports`, listing
+    /// all issues known to affect a given package version.
+    ///
+    /// These are calculated from `advisories` and `issues` fields
+    /// of the package reviews of reviewers intside a given `trust_set`
+    /// of at least given `trust_level_required`.
+    pub fn get_open_issues_for_version(
+        &self,
+        source: &str,
+        name: &str,
+        queried_version: &Version,
+        trust_set: &TrustSet,
+        trust_level_required: TrustLevel,
+    ) -> HashMap<String, IssueDetails> {
+        // This is one of the most complicated calculations in whole crev. I hate this code
+        // already, and I have barely put it together.
+
+        // Here we track all the reported isue by issue id
+        let mut issue_reports_by_id: HashMap<String, IssueDetails> = HashMap::new();
+
+        // First we go through all the reports in previous versions with `issues` fields and collect these.
+        // Easy.
+        for (review, issue) in self
+            .get_pkg_reviews_lte_version(source, name, queried_version)
+            .filter(|review| {
+                let effective = trust_set.get_effective_trust_level(&review.from().id);
+                effective >= trust_level_required
+            })
+            .flat_map(move |review| review.issues.iter().map(move |issue| (review, issue)))
+            .filter(|(review, issue)| {
+                issue.is_for_version_when_reported_in_version(
+                    queried_version,
+                    &review.package.id.version,
+                )
+            })
+        {
+            issue_reports_by_id
+                .entry(issue.id.clone())
+                .or_default()
+                .issues
+                .insert(PkgVersionReviewId::from(review));
+        }
+
+        // Now the complicated part. We go through all the advisories for all the versions
+        // of given package.
+        //
+        // Advisories itself have two functions: first, they might have report an issue
+        // by advertising that a given version should be upgraded to a newer version.
+        //
+        // Second - they might cancel `issues` inside `issue_reports_by_id` because they
+        // advertise a fix that happened somewhere between the `issue` report and
+        // the current `queried_version`.
+        for (review, advisory) in self
+            .get_pkg_reviews_for_name(source, name)
+            .filter(|review| {
+                let effective = trust_set.get_effective_trust_level(&review.from().id);
+                effective >= trust_level_required
+            })
+            .flat_map(move |review| {
+                review
+                    .advisories
+                    .iter()
+                    .map(move |advisory| (review, advisory))
+            })
+        {
+            // Add new issue reports created by the advisory
+            if advisory.is_for_version_when_reported_in_version(
+                &queried_version,
+                &review.package.id.version,
+            ) {
+                for id in &advisory.ids {
+                    issue_reports_by_id
+                        .entry(id.clone())
+                        .or_default()
+                        .issues
+                        .insert(PkgVersionReviewId::from(review));
+                }
+            }
+
+            // Remove the reports that are already fixed
+            for id in &advisory.ids {
+                if let Some(mut issue_marker) = issue_reports_by_id.get_mut(id) {
+                    let issues = std::mem::replace(&mut issue_marker.issues, HashSet::new());
+                    issue_marker.issues = issues
+                        .into_iter()
+                        .filter(|pkg_review_id| {
+                            let signature = &self
+                                .package_review_signatures_by_pkg_review_id
+                                .get(pkg_review_id)
+                                .expect("review for this signature")
+                                .value;
+                            let issue_review = self
+                                .package_review_by_signature
+                                .get(signature)
+                                .expect("review for this pkg_review_id");
+                            !advisory.is_for_version_when_reported_in_version(
+                                &issue_review.package.id.version,
+                                &review.package.id.version,
+                            )
+                        })
+                        .collect();
+                }
+            }
+        }
+
+        issue_reports_by_id
+            .into_iter()
+            .filter(|(_id, markers)| !markers.issues.is_empty() || !markers.advisories.is_empty())
+            .collect()
+    }
+
+    pub fn get_pkg_reviews_with_issues_for_version<'a, 'b, 'c: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        queried_version: &'c Version,
+        trust_set: &'c TrustSet,
+        trust_level_required: TrustLevel,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.get_pkg_reviews_with_issues_for_name(source, name, trust_set, trust_level_required)
+            .filter(move |review| {
+                !review.issues.is_empty()
+                    || review.advisories.iter().any(|advi| {
+                        advi.is_for_version_when_reported_in_version(
+                            &queried_version,
+                            &review.package.id.version,
+                        )
+                    })
+            })
+    }
+
+    pub fn get_pkg_reviews_with_issues_for_name<'a, 'b, 'c: 'a>(
+        &'a self,
+        source: &'b str,
+        name: &'c str,
+        trust_set: &'c TrustSet,
+        trust_level_required: TrustLevel,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.get_pkg_reviews_for_name(source, name)
+            .filter(move |review| {
+                let effective = trust_set.get_effective_trust_level(&review.from().id);
+                effective >= trust_level_required
+            })
+            .filter(|review| !review.issues.is_empty() || !review.advisories.is_empty())
+    }
+
+    pub fn get_pkg_reviews_with_issues_for_source<'a, 'b, 'c: 'a>(
+        &'a self,
+        source: &'b str,
+        trust_set: &'c TrustSet,
+        trust_level_required: TrustLevel,
+    ) -> impl Iterator<Item = &proof::review::Package> {
+        self.get_pkg_reviews_for_source(source)
+            .filter(move |review| {
+                let effective = trust_set.get_effective_trust_level(&review.from().id);
+                effective >= trust_level_required
+            })
+            .filter(|review| !review.issues.is_empty() || !review.advisories.is_empty())
+    }
+
+    pub fn unique_package_review_proof_count(&self) -> usize {
+        self.package_review_signatures_by_pkg_review_id.len()
+    }
+
+    pub fn unique_trust_proof_count(&self) -> usize {
+        self.trust_id_to_id
+            .iter()
+            .fold(0, |count, (_id, set)| count + set.len())
+    }
+
     fn add_code_review(&mut self, review: &review::Code) {
-        let from = &review.from;
+        let from = &review.from();
         self.record_url_from_from_field(&review.date_utc(), &from);
         for _file in &review.files {
             // not implemented right now; just ignore
@@ -158,108 +737,110 @@ impl ProofDB {
     }
 
     fn add_package_review(&mut self, review: &review::Package, signature: &str) {
-        let from = &review.from;
+        self.insertion_counter += 1;
+
+        let from = &review.from();
         self.record_url_from_from_field(&review.date_utc(), &from);
 
         self.package_review_by_signature
             .entry(signature.to_owned())
             .or_insert_with(|| review.to_owned());
 
-        let unique = UniquePackageReview::from(review.clone());
+        let pkg_review_id = PkgVersionReviewId::from(review);
         let timestamp_signature = TimestampedSignature::from((review.date(), signature.to_owned()));
+        let timestamp_flags = TimestampedFlags::from((review.date(), review.flags.clone()));
 
-        timestamp_signature
-            .clone()
-            .insert_into_or_update_to_more_recent(
-                self.package_review_signatures_by_package_digest
-                    .entry(review.package.digest.to_owned())
-                    .or_insert_with(|| default())
-                    .entry(unique.clone()),
-            );
+        self.package_review_signatures_by_package_digest
+            .entry(review.package.digest.to_owned())
+            .or_default()
+            .entry(pkg_review_id.clone())
+            .and_modify(|s| s.update_to_more_recent(&timestamp_signature))
+            .or_insert_with(|| timestamp_signature.clone());
 
-        timestamp_signature.insert_into_or_update_to_more_recent(
-            self.package_review_signatures_by_unique_package_review
-                .entry(unique.clone()),
-        );
+        self.package_review_signatures_by_pkg_review_id
+            .entry(pkg_review_id.clone())
+            .and_modify(|s| s.update_to_more_recent(&timestamp_signature))
+            .or_insert_with(|| timestamp_signature.clone());
 
-        self.package_reviews_by_source
-            .entry(review.package.source.to_owned())
+        self.package_reviews
+            .entry(review.package.id.id.source.clone())
             .or_default()
-            .insert(unique.clone());
-        self.package_reviews_by_name
-            .entry((
-                review.package.source.to_owned(),
-                review.package.name.to_owned(),
-            ))
+            .entry(review.package.id.id.name.clone())
             .or_default()
-            .insert(unique.clone());
-        self.package_reviews_by_version
-            .entry((
-                review.package.source.to_owned(),
-                review.package.name.to_owned(),
-                review.package.version.to_owned(),
-            ))
+            .entry(review.package.id.version.clone())
             .or_default()
-            .insert(unique);
+            .insert(pkg_review_id);
+
+        self.package_alternatives
+            .entry(review.package.id.id.clone())
+            .or_default()
+            .entry(review.from().id.clone())
+            .and_modify(|a| a.update_to_more_recent(&timestamp_signature))
+            .or_insert_with(|| timestamp_signature);
+
+        self.package_flags
+            .entry(review.package.id.id.clone())
+            .or_default()
+            .entry(review.from().id.clone())
+            .and_modify(|f| f.update_to_more_recent(&timestamp_flags))
+            .or_insert_with(|| timestamp_flags);
     }
 
     pub fn get_package_review_count(
         &self,
         source: &str,
         name: Option<&str>,
-        version: Option<&str>,
+        version: Option<&Version>,
     ) -> usize {
         self.get_package_reviews_for_package(source, name, version)
             .count()
     }
 
-    pub fn get_package_reviews_for_package(
-        &self,
-        source: &str,
-        name: Option<&str>,
-        version: Option<&str>,
-    ) -> impl Iterator<Item = proof::review::Package> {
-        let mut proofs: Vec<_> = match (name, version) {
-            (Some(name), Some(version)) => self.package_reviews_by_version.get(&(
-                source.to_owned(),
-                name.to_owned(),
-                version.to_owned(),
-            )),
-
-            (Some(name), None) => self
-                .package_reviews_by_name
-                .get(&(source.to_owned(), name.to_owned())),
-
-            (None, None) => self.package_reviews_by_source.get(source),
-
+    pub fn get_package_reviews_for_package<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: Option<&'c str>,
+        version: Option<&'d Version>,
+    ) -> impl Iterator<Item = &'a proof::review::Package> + 'a {
+        match (name, version) {
+            (Some(ref name), Some(ref version)) => {
+                Box::new(self.get_pkg_reviews_for_version(source, name, version))
+                    as Box<dyn Iterator<Item = _>>
+            }
+            (Some(ref name), None) => Box::new(self.get_pkg_reviews_for_name(source, name)),
+            (None, None) => Box::new(self.get_pkg_reviews_for_source(source)),
             (None, Some(_)) => panic!("Wrong usage"),
         }
-        .into_iter()
-        .flat_map(|s| s)
-        .map(|unique_package_review| {
-            self.package_review_by_signature[&self
-                .package_review_signatures_by_unique_package_review[unique_package_review]
-                .value]
-                .clone()
-        })
-        .collect();
+    }
 
-        proofs.sort_by(|a, b| a.date().cmp(&b.date()));
+    pub fn get_package_reviews_for_package_sorted<'a, 'b, 'c: 'a, 'd: 'a>(
+        &'a self,
+        source: &'b str,
+        name: Option<&'c str>,
+        version: Option<&'d Version>,
+    ) -> Vec<proof::review::Package> {
+        let mut proofs: Vec<_> = self
+            .get_package_reviews_for_package(source, name, version)
+            .cloned()
+            .collect();
 
-        proofs.into_iter()
+        proofs.sort_by(|a, b| a.date_utc().cmp(&b.date_utc()));
+
+        proofs
     }
 
     fn add_trust_raw(&mut self, from: &Id, to: &Id, date: DateTime<Utc>, trust: TrustLevel) {
-        TimestampedTrustLevel { value: trust, date }.insert_into_or_update_to_more_recent(
-            self.trust_id_to_id
-                .entry(from.to_owned())
-                .or_insert_with(HashMap::new)
-                .entry(to.to_owned()),
-        );
+        let tl = TimestampedTrustLevel { value: trust, date };
+        self.trust_id_to_id
+            .entry(from.to_owned())
+            .or_insert_with(HashMap::new)
+            .entry(to.to_owned())
+            .and_modify(|e| e.update_to_more_recent(&tl))
+            .or_insert_with(|| tl);
     }
 
     fn add_trust(&mut self, trust: &proof::Trust) {
-        let from = &trust.from;
+        let from = &trust.from();
         self.record_url_from_from_field(&trust.date_utc(), &from);
         for to in &trust.ids {
             self.add_trust_raw(&from.id, &to.id, trust.date_utc(), trust.trust);
@@ -275,6 +856,27 @@ impl ProofDB {
             .chain(self.url_by_id_secondary.keys())
             .cloned()
             .collect()
+    }
+
+    /// Get all Ids that authored a proof (with total count)
+    pub fn all_author_ids(&self) -> BTreeMap<Id, usize> {
+        let mut res = BTreeMap::new();
+        for (id, set) in &self.trust_id_to_id {
+            *res.entry(id.to_owned()).or_default() += set.len();
+        }
+
+        for uniq_rev in self.package_review_signatures_by_pkg_review_id.keys() {
+            *res.entry(uniq_rev.from.clone()).or_default() += 1;
+        }
+
+        res
+    }
+
+    pub fn get_package_review_by_signature<'a>(
+        &'a self,
+        signature: &str,
+    ) -> Option<&'a review::Package> {
+        self.package_review_by_signature.get(signature)
     }
 
     pub fn get_package_reviews_by_digest<'a>(
@@ -297,45 +899,62 @@ impl ProofDB {
         &self,
         digest: &Digest,
         trust_set: &TrustSet,
+        requirements: &VerificationRequirements,
     ) -> VerificationStatus {
         let reviews: HashMap<Id, review::Package> = self
             .get_package_reviews_by_digest(digest)
-            .map(|review| (review.from.id.clone(), review))
+            .map(|review| (review.from().id.clone(), review))
             .collect();
         // Faster somehow maybe?
-        let reviews_by: HashSet<Id, _> = reviews.keys().map(|s| s.to_owned()).collect();
+        let reviews_by: HashSet<Id, _> = reviews.keys().cloned().collect();
         let trusted_ids: HashSet<_> = trust_set.trusted_ids().cloned().collect();
         let matching_reviewers = trusted_ids.intersection(&reviews_by);
         let mut trust_count = 0;
-        let mut trust_level = TrustLevel::None;
-        let mut flagged_count = 0;
-        let mut dangerous_count = 0;
+        let mut negative_count = 0;
         for matching_reviewer in matching_reviewers {
-            let rating = &reviews[matching_reviewer].review.rating;
-            if Rating::Neutral <= *rating {
-                trust_count += 1;
-                trust_level = std::cmp::max(
-                    trust_level,
-                    trust_set
-                        .get_effective_trust_level(matching_reviewer)
-                        .expect("Id should have been there"),
-                );
-            } else if *rating <= Rating::Dangerous {
-                dangerous_count += 1;
-            } else if *rating < Rating::Neutral {
-                flagged_count += 1;
+            let review = &reviews[matching_reviewer].review;
+            if !review.is_none()
+                && Rating::Neutral <= review.rating
+                && requirements.thoroughness <= review.thoroughness
+                && requirements.understanding <= review.understanding
+            {
+                if TrustLevel::from(requirements.trust_level)
+                    <= trust_set.get_effective_trust_level(matching_reviewer)
+                {
+                    trust_count += 1;
+                }
+            } else if review.rating <= Rating::Negative {
+                negative_count += 1;
             }
         }
 
-        if dangerous_count > 0 {
-            VerificationStatus::Dangerous
-        } else if flagged_count > 0 {
-            VerificationStatus::Flagged
-        } else if trust_count > 0 {
-            VerificationStatus::Verified(trust_level)
+        if negative_count > 0 {
+            VerificationStatus::Negative
+        } else if trust_count >= requirements.redundancy {
+            VerificationStatus::Verified
         } else {
-            VerificationStatus::Unknown
+            VerificationStatus::Insufficient
         }
+    }
+
+    pub fn find_latest_trusted_version(
+        &self,
+        trust_set: &TrustSet,
+        source: &str,
+        name: &str,
+        requirements: &crate::VerificationRequirements,
+    ) -> Option<Version> {
+        self.get_pkg_reviews_for_name(source, name)
+            .filter(|review| {
+                self.verify_package_digest(
+                    &Digest::from_vec(review.package.digest.clone()),
+                    trust_set,
+                    requirements,
+                )
+                .is_verified()
+            })
+            .max_by(|a, b| a.package.id.version.cmp(&b.package.id.version))
+            .map(|review| review.package.id.version.clone())
     }
 
     fn record_url_from_to_field(&mut self, date: &DateTime<Utc>, to: &crev_data::PubId) {
@@ -348,26 +967,39 @@ impl ProofDB {
     }
 
     fn record_url_from_from_field(&mut self, date: &DateTime<Utc>, from: &crev_data::PubId) {
-        TimestampedUrl {
+        let tu = TimestampedUrl {
             value: from.url.clone(),
             date: date.to_owned(),
-        }
-        .insert_into_or_update_to_more_recent(self.url_by_id.entry(from.id.clone()));
+        };
+
+        self.url_by_id
+            .entry(from.id.clone())
+            .and_modify(|e| e.update_to_more_recent(&tu))
+            .or_insert_with(|| tu);
     }
-    fn add_proof(&mut self, proof: &proof::Proof) {
+
+    fn add_proof(&mut self, proof: &proof::Proof) -> Result<()> {
         proof
             .verify()
             .expect("All proofs were supposed to be valid here");
-        match proof.content {
-            Content::Code(ref review) => self.add_code_review(&review),
-            Content::Package(ref review) => self.add_package_review(&review, &proof.signature),
-            Content::Trust(ref trust) => self.add_trust(&trust),
+        match proof.kind() {
+            proof::CodeReview::KIND => self.add_code_review(&proof.parse_content()?),
+            proof::PackageReview::KIND => {
+                self.add_package_review(&proof.parse_content()?, proof.signature())
+            }
+            proof::Trust::KIND => self.add_trust(&proof.parse_content()?),
+            other => bail!("Unknown proof type: {}", other),
         }
+
+        Ok(())
     }
 
     pub fn import_from_iter(&mut self, i: impl Iterator<Item = proof::Proof>) {
         for proof in i {
-            self.add_proof(&proof);
+            // ignore errors
+            if let Err(e) = self.add_proof(&proof) {
+                debug!("Ignoring proof: {}", e);
+            }
         }
     }
 
@@ -422,10 +1054,22 @@ impl ProofDB {
         visited.record_trusted_id(for_id.clone(), for_id.clone(), 0, TrustLevel::High);
 
         while let Some(current) = pending.iter().next().cloned() {
+            debug!("Traversing id: {:?}", current);
             pending.remove(&current);
 
-            for (level, candidate_id) in self.get_trust_list_of_id(&&current.id) {
-                if level == TrustLevel::Distrust {
+            for (direct_trust, candidate_id) in self.get_trust_list_of_id(&&current.id) {
+                debug!(
+                    "{} trusts {} - level: {}",
+                    current.id, candidate_id, direct_trust
+                );
+
+                if visited.distrusted.contains_key(candidate_id) {
+                    debug!("{} is distrusted", candidate_id);
+                    continue;
+                }
+
+                if direct_trust == TrustLevel::Distrust {
+                    debug!("Adding {} to distrusted list", candidate_id);
                     visited
                         .distrusted
                         .entry(candidate_id.clone())
@@ -434,32 +1078,43 @@ impl ProofDB {
                     continue;
                 }
 
+                let effective_trust = std::cmp::min(
+                    direct_trust,
+                    visited
+                        .get_effective_trust_level_opt(&current.id)
+                        .expect("Id should have been inserted to `visited` beforehand"),
+                );
+                debug!("Effective trust for {} {}", candidate_id, effective_trust);
+
+                if effective_trust < TrustLevel::None {
+                    unreachable!(
+                        "this should not happen: candidate_effective_trust < TrustLevel::None"
+                    );
+                }
+
                 let candidate_distance_from_current =
-                    if let Some(v) = params.distance_by_level(level) {
+                    if let Some(v) = params.distance_by_level(effective_trust) {
                         v
                     } else {
+                        debug!("Not traversing {}: trust too low", candidate_id);
                         continue;
                     };
 
-                if visited.distrusted.contains_key(candidate_id) {
-                    continue;
-                }
                 let candidate_total_distance = current.distance + candidate_distance_from_current;
 
-                if candidate_total_distance > params.max_distance {
-                    continue;
-                }
-
-                let candidate_effective_trust = std::cmp::min(
-                    level,
-                    visited
-                        .get_effective_trust_level(&current.id)
-                        .expect("Id should have been inserted to `visited` beforehand"),
+                debug!(
+                    "Distance of {} from {}: {}. Total distance from root: {}.",
+                    candidate_id,
+                    current.id,
+                    candidate_distance_from_current,
+                    candidate_total_distance
                 );
 
-                if candidate_effective_trust < TrustLevel::None {
-                    // can this even happen?
-                    debug_assert!(false);
+                if candidate_total_distance > params.max_distance {
+                    debug!(
+                        "Total distance of {}: {} higher than max_distance: {}.",
+                        candidate_id, candidate_total_distance, params.max_distance
+                    );
                     continue;
                 }
 
@@ -467,12 +1122,17 @@ impl ProofDB {
                     candidate_id.clone(),
                     current.id.clone(),
                     candidate_total_distance,
-                    candidate_effective_trust,
+                    effective_trust,
                 ) {
-                    pending.insert(Visit {
+                    let visit = Visit {
                         distance: candidate_total_distance,
                         id: candidate_id.to_owned(),
-                    });
+                    };
+                    if pending.insert(visit.clone()) {
+                        debug!("{:?} inserted for visit", visit);
+                    } else {
+                        debug!("{:?} alreading pending", visit);
+                    }
                 }
             }
         }
@@ -489,6 +1149,7 @@ impl ProofDB {
 }
 
 /// Details of a one Id that is
+#[derive(Debug, Clone)]
 struct TrustedIdDetails {
     distance: u64,
     // effective, global trust from the root of the WoT
@@ -496,7 +1157,7 @@ struct TrustedIdDetails {
     referers: HashMap<Id, TrustLevel>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct TrustSet {
     trusted: HashMap<Id, TrustedIdDetails>,
     distrusted: HashMap<Id, HashSet<Id>>,
@@ -505,6 +1166,14 @@ pub struct TrustSet {
 impl TrustSet {
     pub fn trusted_ids(&self) -> impl Iterator<Item = &Id> {
         self.trusted.keys()
+    }
+
+    pub fn contains_trusted(&self, id: &Id) -> bool {
+        self.trusted.contains_key(id)
+    }
+
+    pub fn contains_distrusted(&self, id: &Id) -> bool {
+        self.distrusted.contains_key(id)
     }
 
     /// Record that an Id is considered trusted
@@ -565,7 +1234,12 @@ impl TrustSet {
         }
     }
 
-    pub fn get_effective_trust_level(&self, id: &Id) -> Option<TrustLevel> {
+    pub fn get_effective_trust_level(&self, id: &Id) -> TrustLevel {
+        self.get_effective_trust_level_opt(id)
+            .unwrap_or(TrustLevel::None)
+    }
+
+    pub fn get_effective_trust_level_opt(&self, id: &Id) -> Option<TrustLevel> {
         self.trusted.get(id).map(|details| details.effective_trust)
     }
 }
@@ -578,6 +1252,15 @@ pub struct TrustDistanceParams {
 }
 
 impl TrustDistanceParams {
+    pub fn new_no_wot() -> Self {
+        Self {
+            max_distance: 0,
+            high_trust_distance: 1,
+            medium_trust_distance: 1,
+            low_trust_distance: 1,
+        }
+    }
+
     fn distance_by_level(&self, level: TrustLevel) -> Option<u64> {
         use crev_data::proof::trust::TrustLevel::*;
         Some(match level {

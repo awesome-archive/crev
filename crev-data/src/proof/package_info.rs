@@ -1,14 +1,36 @@
 use crate::proof;
 
 use crev_common::serde::{as_base64, from_base64};
+use derive_builder::Builder;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Builder, Serialize, Deserialize, PartialEq, Hash, Eq)]
+pub struct PackageId {
+    pub source: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Builder, Serialize, Deserialize, PartialEq, Hash, Eq)]
+pub struct PackageVersionId {
+    #[serde(flatten)]
+    pub id: PackageId,
+    pub version: Version,
+}
+
+impl PackageVersionId {
+    pub fn new(source: String, name: String, version: Version) -> Self {
+        Self {
+            id: PackageId { source, name },
+            version,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Builder, Serialize, Deserialize, PartialEq)]
 pub struct PackageInfo {
     #[serde(flatten)]
-    pub id: Option<crate::id::PubId>,
-    pub source: String,
-    pub name: String,
-    pub version: String,
+    pub id: PackageVersionId,
 
     #[serde(skip_serializing_if = "proof::equals_default", default)]
     pub revision: String,

@@ -1,10 +1,12 @@
-use crate::prelude::*;
-use crate::ProofStore;
-use crate::{local::Local, util};
-use crate::id::PassphraseFn;
-use crev_data::proof;
-use crev_data::Digest;
+use crate::{id::PassphraseFn, local::Local, prelude::*, proofdb::TrustSet, util, ProofStore};
+use crev_common::convert::OptionDeref;
+use crev_data::{
+    proof::{self, ContentExt},
+    Digest,
+};
+use failure::{bail, format_err, Fail};
 use git2;
+use serde::{Deserialize, Serialize};
 use serde_yaml;
 use std::{
     collections::HashSet,
@@ -150,21 +152,33 @@ impl Repo {
         Ok(())
     }
 
-    pub fn get_proof_rel_store_path(&self, proof: &proof::Proof) -> PathBuf {
-        PathBuf::from("proofs").join(crate::proof::rel_package_path(&proof.content))
+    pub fn get_proof_rel_store_path(&self, _proof: &proof::Proof) -> PathBuf {
+        unimplemented!();
     }
 
-    pub fn package_verify(&mut self, allow_dirty: bool) -> Result<crate::VerificationStatus> {
+    pub fn package_verify(
+        &mut self,
+        local: &Local,
+        allow_dirty: bool,
+        for_id: Option<String>,
+        params: &crate::TrustDistanceParams,
+        requirements: &crate::VerificationRequirements,
+    ) -> Result<crate::VerificationStatus> {
         if !allow_dirty && self.is_unclean()? {
             bail!("Git repository is not in a clean state");
         }
 
-        let local = Local::auto_open()?;
-        let params = Default::default();
-        let (db, trusted_set) = local.load_db(&params)?;
+        let db = local.load_db()?;
+
+        let trust_set =
+            if let Some(id) = local.get_for_id_from_str_opt(OptionDeref::as_deref(&for_id))? {
+                db.calculate_trust_set(&id, &params)
+            } else {
+                TrustSet::default()
+            };
         let ignore_list = HashSet::new();
         let digest = crate::get_recursive_digest_for_git_dir(&self.root_dir, &ignore_list)?;
-        Ok(db.verify_package_digest(&digest, &trusted_set))
+        Ok(db.verify_package_digest(&digest, &trust_set, requirements))
     }
 
     pub fn package_digest(&mut self, allow_dirty: bool) -> Result<Digest> {
@@ -223,7 +237,11 @@ impl Repo {
         bail!("Couldn't identify revision info");
     }
 
-    pub fn trust_package(&mut self, passphrase_callback: PassphraseFn, allow_dirty: bool) -> Result<()> {
+    pub fn trust_package(
+        &mut self,
+        passphrase_callback: PassphraseFn<'_>,
+        allow_dirty: bool,
+    ) -> Result<()> {
         if !self.staging()?.is_empty() {
             bail!("Can't review with uncommitted staged files.");
         }
@@ -244,7 +262,7 @@ impl Repo {
             .build()
             .map_err(|e| format_err!("{}", e))?;
 
-        let review = util::edit_proof_content_iteractively(&review.into())?;
+        let review = util::edit_proof_content_iteractively(&review, None, None)?;
 
         let proof = review.sign_by(&id)?;
 
@@ -252,7 +270,11 @@ impl Repo {
         Ok(())
     }
 
-    pub fn commit(&mut self, passphrase_callback: PassphraseFn, allow_dirty: bool) -> Result<()> {
+    pub fn commit(
+        &mut self,
+        passphrase_callback: PassphraseFn<'_>,
+        allow_dirty: bool,
+    ) -> Result<()> {
         if self.staging()?.is_empty() && !allow_dirty {
             bail!("No reviews to commit. Use `add` first or use `-a` for the whole package.");
         }
@@ -269,7 +291,7 @@ impl Repo {
             .build()
             .map_err(|e| format_err!("{}", e))?;
 
-        let review = util::edit_proof_content_iteractively(&review.into())?;
+        let review = util::edit_proof_content_iteractively(&review, None, None)?;
 
         let proof = review.sign_by(&id)?;
 

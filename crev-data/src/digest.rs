@@ -1,7 +1,6 @@
 use std::fmt;
 
-
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub struct Digest(Vec<u8>);
 
 impl Digest {
@@ -21,7 +20,7 @@ impl Digest {
 }
 
 impl fmt::Display for Digest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&crev_common::base64_encode(&self.0))
     }
 }

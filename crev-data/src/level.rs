@@ -1,4 +1,5 @@
-use crate::Result;
+use failure::Fail;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,15 +29,20 @@ impl fmt::Display for Level {
     }
 }
 
-impl Level {
-    #[allow(unused)]
-    fn from_str(s: &str) -> Result<Level> {
+#[derive(Fail, Debug)]
+#[fail(display = "Can't convert string to Level")]
+pub struct FromStrErr;
+
+impl std::str::FromStr for Level {
+    type Err = FromStrErr;
+
+    fn from_str(s: &str) -> std::result::Result<Level, FromStrErr> {
         Ok(match s {
             "none" => Level::None,
             "low" => Level::Low,
             "medium" => Level::Medium,
             "high" => Level::High,
-            _ => bail!("Unknown level: {}", s),
+            _ => return Err(FromStrErr),
         })
     }
 }

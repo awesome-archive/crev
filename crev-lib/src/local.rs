@@ -1,35 +1,80 @@
-use crate::ProofStore;
 use crate::{
+    activity::ReviewActivity,
     id::{self, LockedId, PassphraseFn},
     prelude::*,
-    proofdb::TrustSet,
-    util::self
+    util, ProofDB, ProofStore, TrustProofType,
 };
-use crev_common;
-use crev_data::{id::OwnId, proof, proof::trust::TrustLevel, Id, PubId, Url};
+use crev_common::{
+    self, sanitize_name_for_fs, sanitize_url_for_fs,
+    serde::{as_base64, from_base64},
+};
+use crev_data::{
+    id::OwnId,
+    proof::{self, trust::TrustLevel},
+    Id, PubId, Url,
+};
 use default::default;
 use directories::ProjectDirs;
-use failure::ResultExt;
+use failure::{bail, format_err, ResultExt};
 use git2;
 use insideout::InsideOut;
-use resiter_dpc_tmp::*;
+use resiter::*;
+use serde::{Deserialize, Serialize};
 use serde_yaml;
-use std::cell::RefCell;
 use std::{
+    cell::RefCell,
     collections::HashSet,
     ffi::OsString,
     fs,
-    io::Write,
+    io::{BufRead, Write},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 const CURRENT_USER_CONFIG_SERIALIZATION_VERSION: i64 = -1;
+
+fn generete_salt() -> Vec<u8> {
+    crev_common::rand::random_vec(32)
+}
+
+/// Backfill the host salt
+///
+/// For people that have configs generated when
+/// `host_salt` was not a thing - generate some
+/// form of stable id
+///
+/// TODO: at some point this should no longer be neccessary
+fn backfill_salt() -> Vec<u8> {
+    crev_common::blake2b256sum(b"BACKFILLED_SUM")
+}
+
+fn is_none_or_empty(s: &Option<String>) -> bool {
+    if let Some(s) = s {
+        s.is_empty()
+    } else {
+        true
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserConfig {
     pub version: i64,
     #[serde(rename = "current-id")]
     pub current_id: Option<Id>,
+    #[serde(
+        rename = "host-salt",
+        serialize_with = "as_base64",
+        deserialize_with = "from_base64",
+        default = "backfill_salt"
+    )]
+    host_salt: Vec<u8>,
+
+    #[serde(
+        rename = "open-cmd",
+        skip_serializing_if = "is_none_or_empty",
+        default = "Option::default"
+    )]
+    pub open_cmd: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -37,6 +82,8 @@ impl Default for UserConfig {
         Self {
             version: CURRENT_USER_CONFIG_SERIALIZATION_VERSION,
             current_id: None,
+            host_salt: generete_salt(),
+            open_cmd: None,
         }
     }
 }
@@ -49,6 +96,20 @@ impl UserConfig {
     pub fn get_current_userid_opt(&self) -> Option<&Id> {
         self.current_id.as_ref()
     }
+
+    pub fn edit_iteractively(&self) -> Result<Self> {
+        let mut text = serde_yaml::to_string(self)?;
+        loop {
+            text = util::edit_text_iteractively(&text)?;
+            match serde_yaml::from_str(&text) {
+                Err(e) => {
+                    eprintln!("There was an error parsing content: {}", e);
+                    crev_common::try_again_or_cancel()?;
+                }
+                Ok(s) => return Ok(s),
+            }
+        }
+    }
 }
 
 /// Local config stored in `~/.config/crev`
@@ -58,12 +119,13 @@ pub struct Local {
     root_path: PathBuf,
     cache_path: PathBuf,
     cur_url: RefCell<Option<Url>>,
+    user_config: RefCell<Option<UserConfig>>,
 }
 
 impl Local {
     #[allow(clippy::new_ret_no_self)]
     fn new() -> Result<Self> {
-        let proj_dir = ProjectDirs::from("dev", "", "crev")
+        let proj_dir = ProjectDirs::from("", "", "crev")
             .expect("no valid home directory path could be retrieved from the operating system");
         let root_path = proj_dir.config_dir().into();
         let cache_path = proj_dir.cache_dir().into();
@@ -71,7 +133,12 @@ impl Local {
             root_path,
             cache_path,
             cur_url: RefCell::new(None),
+            user_config: RefCell::new(None),
         })
+    }
+
+    pub fn get_root_path(&self) -> &Path {
+        &self.root_path
     }
 
     pub fn get_root_cache_dir(&self) -> &Path {
@@ -82,9 +149,10 @@ impl Local {
         let repo = Self::new()?;
         fs::create_dir_all(&repo.cache_remotes_path())?;
         if !repo.root_path.exists() || !repo.user_config_path().exists() {
-            bail!("User config not-initialized. Use `crev new id` to generate CrevID.");
+            bail!("User config not-initialized. Use `crev id new` to generate CrevID.");
         }
 
+        *repo.user_config.borrow_mut() = Some(repo.load_user_config()?);
         Ok(repo)
     }
 
@@ -99,6 +167,7 @@ impl Local {
         }
         let config: UserConfig = default();
         repo.store_user_config(&config)?;
+        *repo.user_config.borrow_mut() = Some(config);
         Ok(repo)
     }
 
@@ -116,6 +185,26 @@ impl Local {
         Ok(self.load_user_config()?.get_current_userid()?.to_owned())
     }
 
+    pub fn read_current_id_opt(&self) -> Result<Option<crev_data::Id>> {
+        Ok(self.load_user_config()?.get_current_userid_opt().cloned())
+    }
+
+    /// Calculate `for_id` that is used in a lot of operations
+    ///
+    /// * if `id_str` is given - convert to Id
+    /// * otherwise return current id
+    pub fn get_for_id_from_str_opt(&self, id_str: Option<&str>) -> Result<Option<Id>> {
+        id_str
+            .map(crev_data::id::Id::crevid_from_str)
+            .or_else(|| self.read_current_id_opt().inside_out())
+            .inside_out()
+    }
+
+    pub fn get_for_id_from_str(&self, id_str: Option<&str>) -> Result<Id> {
+        self.get_for_id_from_str_opt(id_str)?
+            .ok_or_else(|| format_err!("Id not specified and current id not set"))
+    }
+
     pub fn save_current_id(&self, id: &Id) -> Result<()> {
         let path = self.id_path(id);
         if !path.exists() {
@@ -126,6 +215,11 @@ impl Local {
 
         let mut config = self.load_user_config()?;
         config.current_id = Some(id.clone());
+        // Change the old, backfilled `host_salt` the first time
+        // the id is being switched
+        if config.host_salt == backfill_salt() {
+            config.host_salt = generete_salt();
+        }
         self.store_user_config(&config)?;
 
         Ok(())
@@ -170,6 +264,53 @@ impl Local {
         self.cache_path.join("remotes")
     }
 
+    fn cache_activity_path(&self) -> PathBuf {
+        self.cache_path.join("activity")
+    }
+
+    fn cache_review_activity_path(
+        &self,
+        source: &str,
+        name: &str,
+        version: &semver::Version,
+    ) -> PathBuf {
+        self.cache_activity_path()
+            .join("review")
+            .join(sanitize_name_for_fs(source))
+            .join(sanitize_name_for_fs(name))
+            .join(sanitize_name_for_fs(&version.to_string()))
+            .with_extension("yaml")
+    }
+
+    pub fn record_review_activity(
+        &self,
+        source: &str,
+        name: &str,
+        version: &semver::Version,
+        activity: &ReviewActivity,
+    ) -> Result<()> {
+        let path = self.cache_review_activity_path(source, name, version);
+
+        crev_common::save_to_yaml_file(&path, activity)?;
+
+        Ok(())
+    }
+
+    pub fn read_review_activity(
+        &self,
+        source: &str,
+        name: &str,
+        version: &semver::Version,
+    ) -> Result<Option<ReviewActivity>> {
+        let path = self.cache_review_activity_path(source, name, version);
+
+        if path.exists() {
+            Ok(Some(crev_common::read_from_yaml_file(&path)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn load_user_config(&self) -> Result<UserConfig> {
         let path = self.user_config_path();
 
@@ -185,10 +326,16 @@ impl Local {
 
         util::store_str_to_file(&path, &config_str)?;
 
+        *self.user_config.borrow_mut() = Some(config.clone());
         Ok(())
     }
 
-    pub fn get_current_userid(&self) -> Result<Option<Id>> {
+    pub fn get_current_userid(&self) -> Result<Id> {
+        self.get_current_userid_opt()?
+            .ok_or_else(|| format_err!("Current Id not set"))
+    }
+
+    pub fn get_current_userid_opt(&self) -> Result<Option<Id>> {
         let config = self.load_user_config()?;
         Ok(config.current_id)
     }
@@ -199,7 +346,7 @@ impl Local {
     }
 
     pub fn read_current_locked_id_opt(&self) -> Result<Option<LockedId>> {
-        self.get_current_userid()?
+        self.get_current_userid_opt()?
             .map(|current_id| self.read_locked_id(&current_id))
             .inside_out()
     }
@@ -211,21 +358,38 @@ impl Local {
 
     pub fn read_current_unlocked_id_opt(
         &self,
-        passphrase_callback: PassphraseFn,
+        passphrase_callback: PassphraseFn<'_>,
     ) -> Result<Option<OwnId>> {
-        self.get_current_userid()?
+        self.get_current_userid_opt()?
             .map(|current_id| self.read_unlocked_id(&current_id, passphrase_callback))
             .inside_out()
     }
 
-    pub fn read_current_unlocked_id(&self, passphrase_callback: PassphraseFn) -> Result<OwnId> {
+    pub fn read_current_unlocked_id(&self, passphrase_callback: PassphraseFn<'_>) -> Result<OwnId> {
         self.read_current_unlocked_id_opt(passphrase_callback)?
             .ok_or_else(|| format_err!("Current Id not set"))
     }
 
-    pub fn read_unlocked_id(&self, id: &Id, passphrase_callback: PassphraseFn) -> Result<OwnId> {
+    pub fn read_unlocked_id(
+        &self,
+        id: &Id,
+        passphrase_callback: PassphraseFn<'_>,
+    ) -> Result<OwnId> {
         let locked = self.read_locked_id(id)?;
-        locked.to_unlocked(passphrase_callback)
+        let mut i = 0;
+        loop {
+            let passphrase = passphrase_callback()?;
+            match locked.to_unlocked(&passphrase) {
+                Ok(o) => return Ok(o),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    if i == 5 {
+                        return Err(e);
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     pub fn save_locked_id(&self, id: &id::LockedId) -> Result<()> {
@@ -281,16 +445,39 @@ impl Local {
         Ok(())
     }
 
-    pub fn init_readme_using_this_repo_file(&self) -> Result<()> {
+    pub fn init_repo_readme_using_template(&self) -> Result<()> {
+        const README_MARKER_V0: &str = "CREV_README_MARKER_V0";
+
         let proof_dir = self.get_proofs_dir_path()?;
-        std::fs::write(proof_dir.join("README.md"), &include_bytes!("../rc/doc/README.md")[..])?;
+        let path = proof_dir.join("README.md");
+        if path.exists() {
+            if let Some(line) = std::io::BufReader::new(std::fs::File::open(&path)?)
+                .lines()
+                .find(|line| {
+                    if let Ok(ref line) = line {
+                        line.trim() != ""
+                    } else {
+                        true
+                    }
+                })
+            {
+                if line?.contains(README_MARKER_V0) {
+                    return Ok(());
+                }
+            }
+        }
+
+        std::fs::write(
+            proof_dir.join("README.md"),
+            &include_bytes!("../rc/doc/README.md")[..],
+        )?;
         self.proof_dir_git_add_path(Path::new("README.md"))?;
         Ok(())
     }
 
     // Get path relative to `get_proofs_dir_path` to store the `proof`
-    fn get_proof_rel_store_path(&self, proof: &proof::Proof) -> PathBuf {
-        crate::proof::rel_store_path(&proof.content)
+    fn get_proof_rel_store_path(&self, proof: &proof::Proof, host_salt: &[u8]) -> PathBuf {
+        crate::proof::rel_store_path(&proof, host_salt)
     }
 
     fn get_cur_url(&self) -> Result<Option<Url>> {
@@ -311,14 +498,26 @@ impl Local {
     }
 
     pub fn get_proofs_dir_path_for_url(&self, url: &Url) -> Result<PathBuf> {
-        Ok(self.user_proofs_path().join(url.digest().to_string()))
+        let old_path = self.user_proofs_path().join(url.digest().to_string());
+        let new_path = self.user_proofs_path().join(sanitize_url_for_fs(&url.url));
+
+        if old_path.exists() {
+            // we used to use less human-friendly path format; move directories
+            // from old to new path
+            // TODO: get rid of this in some point in the future
+            std::fs::rename(&old_path, &new_path)?;
+        }
+
+        Ok(new_path)
     }
 
     // Path where the `proofs` are stored under `git` repository
     pub fn get_proofs_dir_path_opt(&self) -> Result<Option<PathBuf>> {
-        Ok(self
-            .get_cur_url()?
-            .map(|url| self.root_path.join("proofs").join(url.digest().to_string())))
+        if let Some(url) = self.get_cur_url()? {
+            Ok(Some(self.get_proofs_dir_path_for_url(&url)?))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn get_proofs_dir_path(&self) -> Result<PathBuf> {
@@ -330,8 +529,8 @@ impl Local {
         &self,
         from_id: &PubId,
         id_strings: Vec<String>,
-        trust_or_distrust: crate::TrustOrDistrust,
-    ) -> Result<proof::Content> {
+        trust_or_distrust: TrustProofType,
+    ) -> Result<proof::trust::Trust> {
         if id_strings.is_empty() {
             bail!("No ids given.");
         }
@@ -355,53 +554,67 @@ impl Local {
         }
 
         let trust = from_id.create_trust_proof(
-            pub_ids,
-            if trust_or_distrust.is_trust() {
-                TrustLevel::Medium
-            } else {
-                TrustLevel::Distrust
+            &pub_ids,
+            match trust_or_distrust {
+                TrustProofType::Trust => TrustLevel::Medium,
+                TrustProofType::Distrust => TrustLevel::Distrust,
+                TrustProofType::Untrust => TrustLevel::None,
             },
         )?;
 
-        Ok(util::edit_proof_content_iteractively(&trust.into())?)
+        // TODO: Look up previous trust proof?
+        Ok(util::edit_proof_content_iteractively(
+            &trust.into(),
+            None,
+            None,
+        )?)
     }
 
     pub fn fetch_url(&self, url: &str) -> Result<()> {
-        let _success = util::err_eprint_and_ignore(self.fetch_remote_git(url).compat());
+        let mut db = self.load_db()?;
+        if let Some(dir) = self.fetch_proof_repo_import_and_print_counts(url, &mut db) {
+            let mut db = ProofDB::new();
+            db.import_from_iter(proofs_iter_for_path(dir));
+            eprintln!("Found proofs from:");
+            for (id, count) in db.all_author_ids() {
+                println!("{:>8} {}", count, id);
+            }
+        }
         Ok(())
     }
 
-    pub fn fetch_trusted(&self, trust_params: crate::TrustDistanceParams) -> Result<()> {
-        let mut already_fetched = HashSet::new();
+    pub fn fetch_trusted(
+        &self,
+        trust_params: crate::TrustDistanceParams,
+        for_id: Option<&str>,
+    ) -> Result<()> {
+        let mut already_fetched_ids = HashSet::new();
+        let mut already_fetched_urls = HashSet::new();
         let mut db = crate::ProofDB::new();
         db.import_from_iter(self.proofs_iter()?);
         db.import_from_iter(proofs_iter_for_path(self.cache_remotes_path()));
-        let user_config = self.load_user_config()?;
-        let user_id = user_config.get_current_userid()?;
+        let for_id = self.get_for_id_from_str(for_id)?;
 
         let mut something_was_fetched = true;
         while something_was_fetched {
             something_was_fetched = false;
-            let trust_set =
-                db.calculate_trust_set(user_config.get_current_userid()?, &trust_params);
+            let trust_set = db.calculate_trust_set(&for_id, &trust_params);
 
             for id in trust_set.trusted_ids() {
-                if already_fetched.contains(id) {
+                if already_fetched_ids.contains(id) {
                     continue;
-                } else {
-                    already_fetched.insert(id.to_owned());
                 }
-                if user_id == id {
-                    continue;
-                } else if let Some(url) = db.lookup_url(id) {
-                    let success =
-                        util::err_eprint_and_ignore(self.fetch_remote_git(&url.url).compat());
-                    if success {
-                        something_was_fetched = true;
-                        db.import_from_iter(proofs_iter_for_path(
-                            self.get_remote_git_cache_path(&url.url),
-                        ));
+                already_fetched_ids.insert(id.to_owned());
+
+                if let Some(url) = db.lookup_url(id).cloned() {
+                    let url = url.url;
+                    if already_fetched_urls.contains(&url) {
+                        continue;
                     }
+                    already_fetched_urls.insert(url.clone());
+
+                    self.fetch_proof_repo_import_and_print_counts(&url, &mut db);
+                    something_was_fetched = true;
                 } else {
                     eprintln!("No URL for {}", id);
                 }
@@ -410,42 +623,31 @@ impl Local {
         Ok(())
     }
 
-    fn fetch_all_ids_recursively(&self, mut already_fetched_urls: HashSet<String>) -> Result<()> {
-        let mut already_fetched = HashSet::new();
-        let mut db = crate::ProofDB::new();
-        db.import_from_iter(self.proofs_iter()?);
-        db.import_from_iter(proofs_iter_for_path(self.cache_remotes_path()));
-        let user_config = self.load_user_config()?;
-        let user_id = user_config.get_current_userid_opt();
+    fn fetch_all_ids_recursively(
+        &self,
+        mut already_fetched_urls: HashSet<String>,
+        db: &mut ProofDB,
+    ) -> Result<()> {
+        let mut already_fetched_ids = HashSet::new();
 
         let mut something_was_fetched = true;
         while something_was_fetched {
             something_was_fetched = false;
 
             for id in &db.all_known_ids() {
-                if already_fetched.contains(id) {
+                if already_fetched_ids.contains(id) {
                     continue;
-                } else {
-                    already_fetched.insert(id.to_owned());
                 }
-                if user_id == Some(id) {
-                    continue;
-                } else if let Some(url) = db.lookup_url(id) {
-                    let url = url.url.to_string();
+                already_fetched_ids.insert(id.to_owned());
+                if let Some(url) = db.lookup_url(id).cloned() {
+                    let url = url.url;
 
                     if already_fetched_urls.contains(&url) {
                         continue;
-                    } else {
-                        already_fetched_urls.insert(url.clone());
                     }
-
-                    let success = util::err_eprint_and_ignore(self.fetch_remote_git(&url).compat());
-                    if success {
-                        something_was_fetched = true;
-                        db.import_from_iter(proofs_iter_for_path(
-                            self.get_remote_git_cache_path(&url),
-                        ));
-                    }
+                    already_fetched_urls.insert(url.clone());
+                    self.fetch_proof_repo_import_and_print_counts(&url, db);
+                    something_was_fetched = true;
                 } else {
                     eprintln!("No URL for {}", id);
                 }
@@ -454,29 +656,84 @@ impl Local {
         Ok(())
     }
 
-    pub fn get_remote_git_cache_path(&self, url: &str) -> PathBuf {
+    pub fn get_remote_git_cache_path(&self, url: &str) -> Result<PathBuf> {
         let digest = crev_common::blake2b256sum(url.as_bytes());
         let digest = crev_data::Digest::from_vec(digest);
-        self.cache_remotes_path().join(digest.to_string())
-    }
+        let old_path = self.cache_remotes_path().join(digest.to_string());
+        let new_path = self
+            .cache_remotes_path()
+            .join(sanitize_url_for_fs(&url.to_string()));
 
-    pub fn fetch_remote_git(&self, url: &str) -> Result<()> {
-        let dir = self.get_remote_git_cache_path(url);
-
-        if dir.exists() {
-            eprintln!("Fetching {} to {}", url, dir.display());
-            let repo = git2::Repository::open(dir)?;
-            util::git::fetch_and_checkout_git_repo(&repo)?
-        } else {
-            eprintln!("Cloning {} to {}", url, dir.display());
-            git2::Repository::clone(url, dir)?;
+        if old_path.exists() {
+            // we used to use less human-friendly path format; move directories
+            // from old to new path
+            // TODO: get rid of this in some point in the future
+            std::fs::rename(&old_path, &new_path)?;
         }
 
-        Ok(())
+        Ok(new_path)
+    }
+
+    /// Fetch a git proof repository
+    ///
+    /// Returns url where it was cloned/fetched
+    pub fn fetch_remote_git(&self, url: &str) -> Result<PathBuf> {
+        let dir = self.get_remote_git_cache_path(url)?;
+
+        if dir.exists() {
+            let repo = git2::Repository::open(&dir)?;
+            util::git::fetch_and_checkout_git_repo(&repo)?
+        } else {
+            git2::Repository::clone(url, &dir)?;
+        }
+
+        Ok(dir)
+    }
+
+    pub fn fetch_proof_repo_import_and_print_counts(
+        &self,
+        url: &str,
+        db: &mut ProofDB,
+    ) -> Option<PathBuf> {
+        let prev_pkg_review_count = db.unique_package_review_proof_count();
+        let prev_trust_count = db.unique_trust_proof_count();
+
+        eprint!("Fetching {}... ", url);
+        match self.fetch_remote_git(url) {
+            Ok(dir) => {
+                db.import_from_iter(proofs_iter_for_path(dir.clone()));
+
+                eprint!("OK");
+
+                let new_pkg_review_count =
+                    db.unique_package_review_proof_count() - prev_pkg_review_count;
+                let new_trust_count = db.unique_trust_proof_count() - prev_trust_count;
+
+                if new_trust_count > 0 {
+                    eprint!("; {} new trust proofs", new_trust_count);
+                }
+                if new_pkg_review_count > 0 {
+                    eprint!("; {} new package reviews", new_pkg_review_count);
+                }
+                eprintln!("");
+                Some(dir)
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                None
+            }
+        }
     }
 
     pub fn fetch_all(&self) -> Result<()> {
         let mut fetched_urls = HashSet::new();
+        let mut db = self.load_db()?;
+
+        // Temporarily hardcode `dpc`'s proof-repo url
+        let dpc_url = "https://github.com/dpc/crev-proofs";
+        self.fetch_proof_repo_import_and_print_counts(dpc_url, &mut db);
+        fetched_urls.insert(dpc_url.to_owned());
+
         for entry in fs::read_dir(self.cache_remotes_path())? {
             let path = entry?.path();
             if !path.is_dir() {
@@ -501,9 +758,10 @@ impl Local {
 
             match url {
                 Ok(url) => {
-                    fetched_urls.insert(url.clone());
-                    let _success =
-                        util::err_eprint_and_ignore(self.fetch_remote_git(&url).compat());
+                    if !fetched_urls.contains(&url) {
+                        fetched_urls.insert(url.clone());
+                        self.fetch_proof_repo_import_and_print_counts(&url, &mut db);
+                    }
                 }
                 Err(e) => {
                     eprintln!("ERR: {} {}", path.display(), e);
@@ -511,7 +769,7 @@ impl Local {
             }
         }
 
-        self.fetch_all_ids_recursively(fetched_urls)?;
+        self.fetch_all_ids_recursively(fetched_urls, &mut db)?;
 
         Ok(())
     }
@@ -545,21 +803,28 @@ impl Local {
         Ok(())
     }
 
-    pub fn load_db(
-        &self,
-        params: &crate::TrustDistanceParams,
-    ) -> Result<(crate::ProofDB, TrustSet)> {
-        let user_config = self.load_user_config()?;
+    pub fn edit_user_config(&self) -> Result<()> {
+        let config = self.load_user_config()?;
+        let config = config.edit_iteractively()?;
+        self.store_user_config(&config)?;
+        Ok(())
+    }
+
+    pub fn store_config_open_cmd(&self, cmd: String) -> Result<()> {
+        let mut config = self.load_user_config()?;
+        config.open_cmd = Some(cmd);
+        self.store_user_config(&config)?;
+        Ok(())
+    }
+
+    /// Create a new proofdb, and populate it with local repo
+    /// and cache content.
+    pub fn load_db(&self) -> Result<crate::ProofDB> {
         let mut db = crate::ProofDB::new();
         db.import_from_iter(self.proofs_iter()?);
         db.import_from_iter(proofs_iter_for_path(self.cache_remotes_path()));
 
-        let trust_set = if let Some(id) = user_config.get_current_userid_opt() {
-            db.calculate_trust_set(id, &params)
-        } else {
-            TrustSet::default()
-        };
-        Ok((db, trust_set))
+        Ok(db)
     }
 
     pub fn proof_dir_git_add_path(&self, rel_path: &Path) -> Result<()> {
@@ -637,7 +902,7 @@ impl Local {
         eprintln!("");
         println!("{}", locked);
 
-        self.init_readme_using_this_repo_file()?;
+        self.init_repo_readme_using_template()?;
 
         Ok(())
     }
@@ -652,6 +917,20 @@ impl Local {
     pub fn list_own_ids(&self) -> Result<()> {
         for id in self.list_ids()? {
             println!("{} {}", id.id, id.url.url);
+        }
+        Ok(())
+    }
+
+    pub fn show_own_ids(&self) -> Result<()> {
+        let current = self.read_current_locked_id_opt()?.map(|id| id.to_pubid());
+        for id in self.list_ids()? {
+            let is_current = current.as_ref().map_or(false, |c| c.id == id.id);
+            println!(
+                "{} {}{}",
+                id.id,
+                id.url.url,
+                if is_current { " (current)" } else { "" }
+            );
         }
         Ok(())
     }
@@ -676,7 +955,15 @@ impl Local {
 
 impl ProofStore for Local {
     fn insert(&self, proof: &proof::Proof) -> Result<()> {
-        let rel_store_path = self.get_proof_rel_store_path(proof);
+        let rel_store_path = self.get_proof_rel_store_path(
+            proof,
+            &self
+                .user_config
+                .borrow()
+                .as_ref()
+                .expect("User config loaded")
+                .host_salt,
+        );
         let path = self.get_proofs_dir_path()?.join(&rel_store_path);
 
         fs::create_dir_all(path.parent().expect("Not a root dir"))?;
@@ -696,7 +983,7 @@ impl ProofStore for Local {
         Ok(())
     }
 
-    fn proofs_iter(&self) -> Result<Box<Iterator<Item = proof::Proof>>> {
+    fn proofs_iter(&self) -> Result<Box<dyn Iterator<Item = proof::Proof>>> {
         Ok(Box::new(
             self.get_proofs_dir_path_opt()?
                 .into_iter()
@@ -724,7 +1011,7 @@ fn proofs_iter_for_path(path: PathBuf) -> impl Iterator<Item = proof::Proof> {
         });
 
     let proofs_iter = file_iter
-        .and_then_ok(|path| Ok(proof::Proof::parse_from(&path)?))
+        .and_then_ok(|path| Ok(proof::Proof::parse_from(std::fs::File::open(&path)?)?))
         .flatten_ok()
         .and_then_ok(|proof| {
             proof.verify()?;

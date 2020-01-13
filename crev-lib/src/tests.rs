@@ -1,9 +1,14 @@
 use super::*;
 
-use crev_data::proof::trust::TrustLevel;
-use crev_data::Digest;
-use crev_data::OwnId;
+use crev_data::{
+    proof::{self, trust::TrustLevel, ContentExt},
+    Digest, Level, OwnId,
+};
 use default::default;
+use semver::Version;
+use std::str::FromStr;
+
+mod issues;
 
 // Basic liftime of an `LockedId`:
 //
@@ -15,21 +20,80 @@ use default::default;
 fn lock_and_unlock() -> Result<()> {
     let id = OwnId::generate_for_git_url("https://example.com/crev-proofs");
 
-    let id_relocked =
-        id::LockedId::from_own_id(&id, "password")?.to_unlocked(&|| Ok("password".to_string()))?;
+    let id_relocked = id::LockedId::from_own_id(&id, "password")?.to_unlocked("password")?;
     assert_eq!(id.id.id, id_relocked.id.id);
 
     assert!(id::LockedId::from_own_id(&id, "password")?
-        .to_unlocked(&|| Ok("wrongpassword".to_string()))
+        .to_unlocked("wrongpassword")
         .is_err());
 
     let id_stored = serde_yaml::to_string(&id::LockedId::from_own_id(&id, "pass")?)?;
-    let id_restored: OwnId = serde_yaml::from_str::<id::LockedId>(&id_stored)?
-        .to_unlocked(&|| Ok("pass".to_string()))?;
+    let id_restored: OwnId =
+        serde_yaml::from_str::<id::LockedId>(&id_stored)?.to_unlocked("pass")?;
 
     println!("{}", id_stored);
 
     assert_eq!(id.id.id, id_restored.id.id);
+    Ok(())
+}
+
+#[test]
+fn use_id_generated_by_previous_versions() -> Result<()> {
+    let yaml = r#"
+---
+version: -1
+url: "https://github.com/dpc/crev-proofs-test"
+public-key: mScrJLNL5NV4DH9mSPsqcvU8wu0P_W6bvXhjViZP4aE
+sealed-secret-key: ukQvCTnTX6LmnUaBkoB4IGhIvnMxSNb5T8HoEn6DbFnI1IWzMqsGhkzxVzzc-zDs
+seal-nonce: gUu4izYVvDgZjHFGpcunWmNV3nTgmswvSZsCr3lKboQ
+pass:
+  version: 19
+  variant: argon2id
+  iterations: 192
+  memory-size: 4096
+  lanes: 8
+  salt: 9jeCQhM2dMZErCErRQ_RmZ08X68xpta1tIhTbCHOTs0
+"#;
+
+    let locked = id::LockedId::from_str(yaml)?;
+    let unlocked = locked.to_unlocked("a")?;
+
+    let _trust_proof =
+        unlocked.create_signed_trust_proof(vec![unlocked.as_pubid()], TrustLevel::High)?;
+
+    Ok(())
+}
+
+#[test]
+fn validate_proof_generated_by_previous_version() -> Result<()> {
+    let yaml = r#"
+-----BEGIN CREV PACKAGE REVIEW-----
+version: -1
+date: "2019-04-13T00:04:16.625524407-07:00"
+from:
+  id-type: crev
+  id: mScrJLNL5NV4DH9mSPsqcvU8wu0P_W6bvXhjViZP4aE
+  url: "https://github.com/dpc/crev-proofs-test"
+package:
+  source: "https://crates.io"
+  name: hex
+  version: 0.3.2
+  digest: 6FtxZesHD7pnSlbpp--CF_MPAnJATZI4ZR-Vdwb6Fes
+review:
+  thoroughness: none
+  understanding: medium
+  rating: positive
+comment: THIS IS JUST FOR TEST
+-----BEGIN CREV PACKAGE REVIEW SIGNATURE-----
+NtGu3z1Jtnj6wx8INBrVujcOPz61BiGmJS-UoAOe0XQutatFsEbgAcAo7rBvZz4Q-ccNXIFZtKnXhBDMjVm0Aw
+-----END CREV PACKAGE REVIEW-----
+"#;
+
+    let proofs = crev_data::proof::Proof::parse_from(yaml.as_bytes())?;
+    assert_eq!(proofs.len(), 1);
+
+    proofs[0].verify()?;
+
     Ok(())
 }
 
@@ -50,22 +114,10 @@ fn proofdb_distance() -> Result<()> {
         max_distance: 111,
     };
 
-    let a_to_b = a
-        .as_pubid()
-        .create_trust_proof(vec![b.as_pubid().to_owned()], TrustLevel::High)?
-        .sign_by(&a)?;
-    let b_to_c = b
-        .as_pubid()
-        .create_trust_proof(vec![c.as_pubid().to_owned()], TrustLevel::Medium)?
-        .sign_by(&b)?;
-    let c_to_d = c
-        .as_pubid()
-        .create_trust_proof(vec![d.as_pubid().to_owned()], TrustLevel::Low)?
-        .sign_by(&c)?;
-    let d_to_e = d
-        .as_pubid()
-        .create_trust_proof(vec![e.as_pubid().to_owned()], TrustLevel::High)?
-        .sign_by(&d)?;
+    let a_to_b = a.create_signed_trust_proof(vec![b.as_pubid()], TrustLevel::High)?;
+    let b_to_c = b.create_signed_trust_proof(vec![c.as_pubid()], TrustLevel::Medium)?;
+    let c_to_d = c.create_signed_trust_proof(vec![d.as_pubid()], TrustLevel::Low)?;
+    let d_to_e = d.create_signed_trust_proof(vec![e.as_pubid()], TrustLevel::High)?;
 
     let mut trustdb = ProofDB::new();
 
@@ -83,10 +135,7 @@ fn proofdb_distance() -> Result<()> {
     assert!(trust_set.contains(d.as_ref()));
     assert!(!trust_set.contains(e.as_ref()));
 
-    let b_to_d = b
-        .as_pubid()
-        .create_trust_proof(vec![d.as_pubid().to_owned()], TrustLevel::Medium)?
-        .sign_by(&b)?;
+    let b_to_d = b.create_signed_trust_proof(vec![d.as_pubid()], TrustLevel::Medium)?;
 
     trustdb.import_from_iter(vec![b_to_d].into_iter());
 
@@ -113,10 +162,11 @@ fn overwritting_reviews() -> Result<()> {
     let a = OwnId::generate_for_git_url("https://a");
     let digest = vec![0; 32];
     let package = crev_data::proof::PackageInfo {
-        id: None,
-        source: "source".into(),
-        name: "name".into(),
-        version: "version".into(),
+        id: proof::PackageVersionId::new(
+            "source".into(),
+            "name".into(),
+            Version::parse("1.0.0").unwrap(),
+        ),
         digest: digest.clone(),
         digest_type: crev_data::proof::default_digest_type(),
         revision: "".into(),
@@ -152,26 +202,69 @@ fn overwritting_reviews() -> Result<()> {
         assert_eq!(
             trustdb
                 .get_package_reviews_for_package(
-                    &package.source,
-                    Some(&package.name),
-                    Some(&package.version)
+                    &package.id.id.source,
+                    Some(&package.id.id.name),
+                    Some(&package.id.version)
                 )
                 .count(),
             1
         );
         assert_eq!(
             trustdb
-                .get_package_reviews_for_package(&package.source, Some(&package.name), None)
+                .get_package_reviews_for_package(
+                    &package.id.id.source,
+                    Some(&package.id.id.name),
+                    None
+                )
                 .count(),
             1
         );
         assert_eq!(
             trustdb
-                .get_package_reviews_for_package(&package.source, None, None)
+                .get_package_reviews_for_package(&package.id.id.source, None, None)
                 .count(),
             1
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn dont_consider_an_empty_review_as_valid() -> Result<()> {
+    let a = OwnId::generate_for_git_url("https://a");
+    let digest = vec![0; 32];
+    let package = crev_data::proof::PackageInfo {
+        id: proof::PackageVersionId::new(
+            "source".into(),
+            "name".into(),
+            Version::parse("1.0.0").unwrap(),
+        ),
+        digest: digest.clone(),
+        digest_type: crev_data::proof::default_digest_type(),
+        revision: "".into(),
+        revision_type: crev_data::proof::default_revision_type(),
+    };
+
+    let review = crev_data::proof::review::Review::new_none();
+
+    let proof1 = a
+        .as_pubid()
+        .create_package_review_proof(package.clone(), review, "a".into())?
+        .sign_by(&a)?;
+
+    let mut trustdb = ProofDB::new();
+    let trust_set = trustdb.calculate_trust_set(&a.id.id, &default());
+    trustdb.import_from_iter(vec![proof1].into_iter());
+    let verification_reqs = VerificationRequirements {
+        thoroughness: Level::None,
+        understanding: Level::None,
+        trust_level: Level::None,
+        redundancy: 1,
+    };
+    assert!(!trustdb
+        .verify_package_digest(&Digest::from_vec(digest), &trust_set, &verification_reqs)
+        .is_verified());
 
     Ok(())
 }
@@ -191,25 +284,11 @@ fn proofdb_distrust() -> Result<()> {
         max_distance: 10000,
     };
 
-    let a_to_bc = a
-        .as_pubid()
-        .create_trust_proof(
-            vec![b.as_pubid().to_owned(), c.as_pubid().to_owned()],
-            TrustLevel::High,
-        )?
-        .sign_by(&a)?;
-    let b_to_d = b
-        .as_pubid()
-        .create_trust_proof(vec![d.as_pubid().to_owned()], TrustLevel::Low)?
-        .sign_by(&b)?;
-    let d_to_c = d
-        .as_pubid()
-        .create_trust_proof(vec![c.as_pubid().to_owned()], TrustLevel::Distrust)?
-        .sign_by(&d)?;
-    let c_to_e = c
-        .as_pubid()
-        .create_trust_proof(vec![e.as_pubid().to_owned()], TrustLevel::High)?
-        .sign_by(&c)?;
+    let a_to_bc =
+        a.create_signed_trust_proof(vec![b.as_pubid(), c.as_pubid()], TrustLevel::High)?;
+    let b_to_d = b.create_signed_trust_proof(vec![d.as_pubid()], TrustLevel::Low)?;
+    let d_to_c = d.create_signed_trust_proof(vec![c.as_pubid()], TrustLevel::Distrust)?;
+    let c_to_e = c.create_signed_trust_proof(vec![e.as_pubid()], TrustLevel::High)?;
 
     let mut trustdb = ProofDB::new();
 
@@ -227,10 +306,7 @@ fn proofdb_distrust() -> Result<()> {
     assert!(trust_set.contains(d.as_ref()));
     assert!(!trust_set.contains(e.as_ref()));
 
-    let e_to_d = e
-        .as_pubid()
-        .create_trust_proof(vec![d.as_pubid().to_owned()], TrustLevel::Distrust)?
-        .sign_by(&e)?;
+    let e_to_d = e.create_signed_trust_proof(vec![d.as_pubid()], TrustLevel::Distrust)?;
 
     trustdb.import_from_iter(vec![e_to_d].into_iter());
 

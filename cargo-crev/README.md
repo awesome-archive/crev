@@ -1,115 +1,65 @@
 <p align="center">
-  <a href="https://travis-ci.org/dpc/crev">
-      <img src="https://img.shields.io/travis/dpc/cargo-crev/master.svg?style=flat-square" alt="Travis CI Build Status">
+  <a href="https://travis-ci.org/crev-dev/cargo-crev">
+      <img src="https://img.shields.io/travis/crev-dev/cargo-crev/master.svg?style=flat-square" alt="Travis CI Build Status">
   </a>
   <a href="https://crates.io/crates/cargo-crev">
       <img src="http://meritbadge.herokuapp.com/cargo-crev?style=flat-square" alt="crates.io">
   </a>
+  <a href="https://matrix.to/#/!uBhYhtcoNlyEbzfYAW:matrix.org">
+    <img src="https://img.shields.io/matrix/crev:matrix.org.svg?server_fqdn=matrix.org&style=flat-square" alt="crev matrix channel">
+  </a>
   <a href="https://gitter.im/dpc/crev">
-      <img src="https://img.shields.io/badge/GITTER-join%20chat-green.svg?style=flat-square" alt="Gitter Chat">
+    <img src="https://img.shields.io/gitter/room/dpc/crev.svg?style=flat-square" alt="crev gitter channel">
   </a>
   <br>
 </p>
 
-# `cargo-crev` - Cargo Code REView!
+# cargo-crev
 
+> A cryptographically verifiable **c**ode **rev**iew system for the cargo (Rust) package manager.
 
-`cargo-crev` is a tool helping Rust users review crates they use,
-and share it with the community. It works as a recomendation system,
-helps identify poor quality, protects against many attack
-vectors, and aims at driving the quality of Rust ecosystem even higher,
-by encouraging continous peer review culture.
+## Introduction
 
-All of this neatly integrated with the `cargo` itself!
+[Crev](https://github.com/crev-dev/crev/) is a language and ecosystem agnostic, distributed **c**ode **rev**iew system.
 
-## How it works
+`cargo-crev` is an implementation of Crev as a command line tool integrated with `cargo`. This tool helps Rust users evaluate the quality and trustworthiness of their package dependencies.
 
-* Identify your dependencies: list in many useful ways.
-* Review crates: judge their safety, quality and document problems.
-* Publish verifiable reviews in a public git repository.
-* People download your reviews, you download reviews of others.
-* Build a web of trust veting whole Rust ecosystem.
-* Gain reputation and trust. Maybe even monetize it, by reving code for money.
-* Implement it in your company and/or team to stay ahead! 
-* Never again get bitten by unreviewed and untrusted code.
+## Features
 
-## More info
+`cargo-crev` can already:
 
-[Crev](https://github.com/dpc/crev/) is a language and ecosystem agnostic,
-social Code REView system.
+* warn you about untrustworthy crates and security vulnerabilities,
+* display useful metrics about your dependencies,
+* help you identify dependency-bloat,
+* allow you to review most suspicious dependencies and publish your findings,
+* use reviews produced by other users,
+* increase trustworthiness of your own code,
+* build a web of trust of other reputable users to help verify the code you use,
 
-`cargo-crev` is an implementation/frontend of Crev integrated with `cargo` and
-for Rust/crates.io ecosystem.
-
-See it in action:
-
-[![asciicast](https://asciinema.org/a/216695.png)](https://asciinema.org/a/216695?speed=3)
+and many other things with many more to come.
 
 ## Getting started
 
+Static binaries are available from the [releases page](https://github.com/crev-dev/cargo-crev/releases).
+
+Follow the [`cargo-crev` - Getting Started Guide](https://github.com/crev-dev/cargo-crev/blob/master/cargo-crev/src/doc/getting_started.md)
+(more documentation available on [docs.rs](https://docs.rs/cargo-crev)).
+
 `cargo-crev` is a work in progress, but it should be usable at all times.
-Join [crev gitter channel](https://gitter.im/dpc/crev), get help,
+Join our [matrix](https://matrix.to/#/!uBhYhtcoNlyEbzfYAW:matrix.org) or [gitter](https://gitter.im/crev-dev/cargo-crev) channel, get help,
 report problems and feedback. Thank you!
 
-### Dependencies
-`cargo-crev` has a couple of non-Rust dependencies:
+## Raise awareness
 
-#### Unix
-
-```
-# openssl
-sudo apt-get install openssl libssl-dev
-
-# argonautica build system
-sudo apt-get install clang llvm-dev libclang-dev
-```
-
-#### Windows
-
-Make sure you have
-[LLVM](http://releases.llvm.org/download.html) installed and added to your
-path.
-
-### Installing from crates.io
+If you're supportive of the cause, we would appreciate helping to raise awareness of the project. Consider putting the below note in the README of your Rust projects:
 
 ```
-cargo install cargo-crev
+It is recommended to always use [cargo-crev](https://github.com/crev-dev/cargo-crev)
+to verify the trustworthiness of each of your dependencies, including this one.
 ```
 
-and you're all set.
+Thank you!
 
-### Installing from github
+## Changelog
 
-If you want to live on the edge, you can install `cargo-crev` directly from github, too:
-
-```
-git clone https://github.com/dpc/crev
-cd crev
-cargo install -f --path cargo-crev
-```
-
-## Usage
-
-First **create an empty github repository with name: `crev-proofs`**.
-
-```
-cd <your-project>
-cargo crev new id --github-username <username>          # generate your id
-cargo crev fetch url https://github.com/dpc/crev-proofs # fetch proofs from dpc
-cargo crev fetch all                                    # fetch proofs from all known ids
-cargo crev verify                                       # verify your depedencies
-cargo crev query id all                                 # show all known ids
-cargo crev query review                                 # show all reviews
-cargo crev query review <package>                       # show all reviews of a package
-cargo crev trust <id>                                   # trust someone
-cargo crev goto <crate>                                 # jump to crate to review it
-cargo crev review                                       # review a crate (after goto)
-cargo crev review <crate>                               # review a dependency
-cargo crev review --independent <crate> <version>       # review a crate that is not a dependency
-cargo crev commit                                       # commit new proofs (reviews, trust)
-cargo crev push                                         # push proofs to your public github repository
-cargo crev help                                         # see what other things you can do
-```
-
-Join [crev gitter channel](https://gitter.im/dpc/crev) to share your ID with us,
-and find IDs of other Rustaceans!
+Changelog can be found here: https://github.com/crev-dev/cargo-crev/blob/master/cargo-crev/CHANGELOG.md

@@ -1,10 +1,11 @@
-use crate::prelude::*;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use crate::{deps::DownloadsStats, prelude::*};
+use serde::{de::DeserializeOwned, Serialize};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub struct Client {
     client: crates_io_api::SyncClient,
@@ -15,7 +16,7 @@ fn is_fresh(path: &Path) -> Result<bool> {
     let metadata = fs::metadata(path)?;
     let created = metadata.created().or_else(|_e| metadata.modified())?;
     let now = std::time::SystemTime::now();
-    Ok(((now - Duration::from_secs(60 * 60 * 24)) < created) && (created < now))
+    Ok(((now - Duration::from_secs(60 * 60 * 72)) < created) && (created < now))
 }
 
 trait Cacheable: Sized {
@@ -43,15 +44,17 @@ impl Cacheable for crates_io_api::Owners {
     }
 }
 
-fn get_downloads_stats(resp: &crates_io_api::CrateResponse, version: &str) -> (u64, u64) {
-    (
-        resp.versions
+fn get_downloads_stats(resp: &crates_io_api::CrateResponse, version: &Version) -> DownloadsStats {
+    DownloadsStats {
+        version: resp
+            .versions
             .iter()
-            .find(|v| v.num == version)
+            .find(|v| v.num == version.to_string())
             .map(|v| v.downloads)
             .unwrap_or(0),
-        resp.crate_data.downloads,
-    )
+        total: resp.crate_data.downloads,
+        recent: resp.crate_data.recent_downloads.unwrap_or(0),
+    }
 }
 
 impl Client {
@@ -60,7 +63,7 @@ impl Client {
         fs::create_dir_all(&cache_dir)?;
         Ok(Self {
             client: crates_io_api::SyncClient::new(),
-            cache_dir: cache_dir,
+            cache_dir,
         })
     }
 
@@ -115,9 +118,9 @@ impl Client {
         }
     }
 
-    pub fn get_downloads_count(&self, crate_: &str, version: &str) -> Result<(u64, u64)> {
+    pub fn get_downloads_count(&self, crate_: &str, version: &Version) -> Result<DownloadsStats> {
         Ok(get_downloads_stats(
-            &self.get::<crates_io_api::CrateResponse>(crate_, version)?,
+            &self.get::<crates_io_api::CrateResponse>(crate_, &version.to_string())?,
             version,
         ))
     }

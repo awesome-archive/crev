@@ -1,12 +1,12 @@
 [package]
 edition = '2018'
 name = "cargo-crev"
-version = "0.3.0"
+version = "0.14.0"
 description = "Scalable, social, Code REView system that we desperately need - Rust/cargo frontend"
 authors = ["Dawid Ciężarkiewicz <dpc@dpc.pw>"]
 documentation = "https://docs.rs/crev"
-repository = "https://github.com/dpc/crev"
-homepage = "https://github.com/dpc/crev"
+repository = "https://github.com/crev-dev/cargo-crev"
+homepage = "https://github.com/crev-dev/cargo-crev"
 keywords = ["code", "review", "tool", "distributed", "cargo"]
 license = "MPL-2.0 OR MIT OR Apache-2.0"
 readme = "README.md"
@@ -15,20 +15,44 @@ readme = "README.md"
 name = "cargo-crev"
 path = "src/main.rs"
 
+[lib]
+name = "cargo_crev"
+path = "src/lib.rs"
+
 [dependencies]
-failure = "0.1"
-quicli = "0.3"
-structopt = "0.2"
-common_failures = "0.1"
-cargo = "0.32"
-crev-lib = { path = "../crev-lib", version = "0.3" }
-crev-data = { path = "../crev-data", version = "0.3" }
-crev-common = { path = "../crev-common", version = "0.3" }
-semver = "0.9"
-default = "0.1"
-crates_io_api = "0.3"
-serde = "1"
-serde_json = "1"
-dirs = "1"
 atty = "0.2"
-term = "0.5"
+cargo = "0.38"
+common_failures = "0.1"
+crates_io_api = "0.5"
+crev-common = { path = "../crev-common", version = "0.14.0" }
+crev-data = { path = "../crev-data", version = "0.14.0" }
+crev-lib = { path = "../crev-lib", version = "0.14.0" }
+failure = "0.1"
+geiger = "0.3.2"
+insideout = "0.2"
+resiter = "0.3"
+semver = "0.9"
+serde = "1"
+serde_yaml = "0.8.11"
+serde_json = "1"
+structopt = "0.2.16"
+term = "0.6"
+tokei = "10"
+walkdir = "2"
+time = "0.1.42"
+env_logger = { version = "0.6.2", default-features = false, features = ["termcolor", "atty", "humantime"]}
+lazy_static = "1.3"
+rayon = "1.1"
+crossterm = "0.9.6"
+crossbeam = "0.7"
+termimad = "0.6"
+petgraph = "0.4.13"
+num_cpus = "1.10"
+
+[features]
+default = []
+
+documentation = []
+
+[package.metadata.docs.rs]
+all-features = true

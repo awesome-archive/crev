@@ -1,10 +1,13 @@
-use crate::proof;
-use crate::{Result, Url};
-use blake2;
-use crev_common;
-use crev_common::serde::{as_base64, from_base64};
+use crate::{proof, proof::ContentExt, Result, Url};
+use crev_common::{
+    self,
+    serde::{as_base64, from_base64},
+};
+use derive_builder::Builder;
 use ed25519_dalek::{self, PublicKey, SecretKey};
-use rand::OsRng;
+use failure::format_err;
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,7 +29,7 @@ impl fmt::Display for IdType {
 ///
 /// Right now it's only native CrevID, but in future at least GPG
 /// should be supported.
-#[derive(Clone, Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "id-type")]
 pub enum Id {
     #[serde(rename = "crev")]
@@ -34,6 +37,22 @@ pub enum Id {
         #[serde(serialize_with = "as_base64", deserialize_with = "from_base64")]
         id: Vec<u8>,
     },
+}
+
+impl fmt::Debug for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Id::Crev { id } => f.write_str(&crev_common::base64_encode(id)),
+        }
+    }
+}
+
+impl fmt::Display for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Id::Crev { id } => f.write_str(&crev_common::base64_encode(id)),
+        }
+    }
 }
 
 impl Id {
@@ -50,24 +69,21 @@ impl Id {
 
                 let sig_bytes = crev_common::base64_decode(sig_str)?;
                 let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes)?;
-
-                pubkey.verify::<blake2::Blake2b>(content, &signature)?;
+                pubkey.verify(&content, &signature)?;
             }
         }
 
         Ok(())
     }
-}
 
-impl fmt::Display for Id {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Id::Crev { id } => f.write_str(&crev_common::base64_encode(id)),
+            Id::Crev { id } => id.clone(),
         }
     }
 }
 
-#[derive(Clone, Debug, Builder, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Builder, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PubId {
     #[serde(flatten)]
     pub id: Id,
@@ -79,6 +95,7 @@ impl PubId {
     pub fn new(id: Id, url: Url) -> Self {
         PubId { id, url }
     }
+
     pub fn new_from_pubkey(v: Vec<u8>, url: Url) -> Self {
         PubId {
             id: Id::Crev { id: v },
@@ -94,15 +111,15 @@ impl PubId {
         })
     }
 
-    pub fn create_trust_proof(
+    pub fn create_trust_proof<'a>(
         &self,
-        ids: Vec<PubId>,
+        ids: impl IntoIterator<Item = &'a PubId>,
         trust_level: proof::trust::TrustLevel,
     ) -> Result<proof::Trust> {
         Ok(proof::TrustBuilder::default()
             .from(self.clone())
             .trust(trust_level)
-            .ids(ids)
+            .ids(ids.into_iter().cloned().collect())
             .build()
             .map_err(|e| format_err!("{}", e))?)
     }
@@ -146,7 +163,7 @@ impl OwnId {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(url: Url, sec_key: Vec<u8>) -> Result<Self> {
         let sec_key = SecretKey::from_bytes(&sec_key)?;
-        let calculated_pub_key: PublicKey = PublicKey::from_secret::<blake2::Blake2b>(&sec_key);
+        let calculated_pub_key: PublicKey = PublicKey::from(&sec_key);
 
         Ok(Self {
             id: crate::PubId::new_from_pubkey(calculated_pub_key.as_bytes().to_vec(), url),
@@ -158,10 +175,7 @@ impl OwnId {
     }
 
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        self.keypair
-            .sign::<blake2::Blake2b>(&msg)
-            .to_bytes()
-            .to_vec()
+        self.keypair.sign(msg).to_bytes().to_vec()
     }
 
     pub fn type_as_string(&self) -> String {
@@ -177,11 +191,18 @@ impl OwnId {
     }
 
     pub fn generate(url: Url) -> Self {
-        let mut csprng: OsRng = OsRng::new().unwrap();
-        let keypair = ed25519_dalek::Keypair::generate::<blake2::Blake2b, _>(&mut csprng);
+        let keypair = ed25519_dalek::Keypair::generate(&mut OsRng);
         Self {
             id: PubId::new_from_pubkey(keypair.public.as_bytes().to_vec(), url),
             keypair,
         }
+    }
+
+    pub fn create_signed_trust_proof<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a PubId>,
+        trust_level: proof::trust::TrustLevel,
+    ) -> Result<proof::Proof> {
+        self.id.create_trust_proof(ids, trust_level)?.sign_by(&self)
     }
 }

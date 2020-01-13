@@ -1,13 +1,65 @@
-use std::ffi::OsString;
+use common_failures::Result;
+use crev_data::Level;
+use failure::bail;
+use semver::Version;
+use std::{ffi::OsString, path::PathBuf};
+use structopt::StructOpt;
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, StructOpt, Clone, Default)]
 pub struct CrateSelector {
+    /// This crate is not neccesarily a dependency of the current cargo project
+    #[structopt(long = "unrelated", short = "u")]
+    pub unrelated: bool,
+
     pub name: Option<String>,
-    pub version: Option<String>,
+    pub version: Option<Version>,
+}
+
+impl CrateSelector {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.version.is_none()
+    }
+
+    pub fn ensure_name_given(&self) -> Result<()> {
+        if self.name.is_none() {
+            bail!("Crate name argument required!")
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct CargoOpts {
+    #[structopt(long = "features", value_name = "FEATURES")]
+    /// [cargo] Space-separated list of features to activate
+    pub features: Option<String>,
+    #[structopt(long = "all-features")]
+    /// [cargo] Activate all available features
+    pub all_features: bool,
+    #[structopt(long = "no-default-features")]
+    /// [cargo] Do not activate the `default` feature
+    pub no_default_features: bool,
+    #[structopt(long = "no-dev-dependencies")]
+    /// [cargo] Skip dev dependencies.
+    pub no_dev_dependencies: bool,
+    #[structopt(long = "manifest-path", value_name = "PATH", parse(from_os_str))]
+
+    /// [cargo] Path to Cargo.toml
+    pub manifest_path: Option<PathBuf>,
+    #[structopt(short = "Z", value_name = "FLAG")]
+
+    /// [cargo] Unstable (nightly-only) flags to Cargo
+    #[structopt(long = "unstable-flags")]
+    pub unstable_flags: Vec<String>,
+
+    /// [cargo] Skip targets other than specified (no value = autodetect)
+    #[structopt(long = "target")]
+    pub target: Option<Option<String>>,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct NewId {
+pub struct IdNew {
     #[structopt(long = "url")]
     /// URL of a git repository to be associated with the new Id
     pub url: Option<String>,
@@ -20,33 +72,31 @@ pub struct NewId {
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum New {
-    #[structopt(name = "id")]
-    /// Generate a CrevID
-    Id(NewId),
-}
-
-#[derive(Debug, StructOpt, Clone)]
-pub struct SwitchId {
+pub struct IdSwitch {
     /// Own Id to switch to
     pub id: String,
 }
 
 /// Parameters describing trust graph traversal
-#[derive(Debug, StructOpt, Clone)]
-pub struct TrustParams {
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct TrustDistanceParams {
     #[structopt(long = "depth", default_value = "10")]
+    /// [trust-graph-traversal] Maximum allowed distance from the root identity when traversing trust graph
     pub depth: u64,
+
+    /// [trust-graph-traversal] Cost of traversing trust graph edge of high trust level
     #[structopt(long = "high-cost", default_value = "0")]
     pub high_cost: u64,
+    /// [trust-graph-traversal] Cost of traversing trust graph edge of medium trust level
     #[structopt(long = "medium-cost", default_value = "1")]
     pub medium_cost: u64,
+    /// [trust-graph-traversal] Cost of traversing trust graph edge of low trust level
     #[structopt(long = "low-cost", default_value = "5")]
     pub low_cost: u64,
 }
 
-impl From<TrustParams> for crev_lib::TrustDistanceParams {
-    fn from(params: TrustParams) -> Self {
+impl From<TrustDistanceParams> for crev_lib::TrustDistanceParams {
+    fn from(params: TrustDistanceParams) -> Self {
         crev_lib::TrustDistanceParams {
             max_distance: params.depth,
             high_trust_distance: params.high_cost,
@@ -57,29 +107,198 @@ impl From<TrustParams> for crev_lib::TrustDistanceParams {
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct VerifyDeps {
-    #[structopt(long = "verbose", short = "v")]
-    pub verbose: bool,
+pub struct Diff {
+    /// Source version - defaults to the last reviewed one
+    #[structopt(long = "src")]
+    pub src: Option<Version>,
+
+    /// Destination version - defaults to the current one
+    #[structopt(long = "dst")]
+    pub dst: Option<Version>,
 
     #[structopt(flatten)]
-    pub trust_params: TrustParams,
+    pub requirements: VerificationRequirements,
+
+    #[structopt(flatten)]
+    pub trust_params: TrustDistanceParams,
+
+    /// Crate name
+    pub name: String,
+
+    /// Arguments to the `diff` command
+    #[structopt(parse(from_os_str))]
+    pub args: Vec<OsString>,
+}
+
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct TrustLevelRequirements {
+    /// Minimum trust level required
+    #[structopt(long = "trust", default_value = "low")]
+    pub trust_level: crev_data::Level,
+}
+
+/// Verification Requirements
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct VerificationRequirements {
+    #[structopt(flatten)]
+    pub trust_level: TrustLevelRequirements,
+
+    /// Number of reviews required
+    #[structopt(long = "redundancy", default_value = "1")]
+    pub redundancy: u64,
+    /// Required understanding
+    #[structopt(long = "understanding", default_value = "none")]
+    pub understanding_level: Level,
+    /// Required thoroughness
+    #[structopt(long = "thoroughness", default_value = "none")]
+    pub thoroughness_level: Level,
+}
+
+impl From<VerificationRequirements> for crev_lib::VerificationRequirements {
+    fn from(req: VerificationRequirements) -> Self {
+        crev_lib::VerificationRequirements {
+            trust_level: req.trust_level.trust_level,
+            redundancy: req.redundancy,
+            understanding: req.understanding_level,
+            thoroughness: req.thoroughness_level,
+        }
+    }
+}
+
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct Update {
+    #[structopt(flatten)]
+    pub cargo_opts: CargoOpts,
+}
+
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct CrateVerifyCommon {
+    #[structopt(flatten)]
+    pub trust_params: TrustDistanceParams,
+
+    #[structopt(flatten)]
+    pub requirements: VerificationRequirements,
+
+    #[structopt(long = "for-id")]
+    /// Root identity to calculate the Web of Trust for [default: current user id]
+    pub for_id: Option<String>,
+
+    #[structopt(flatten)]
+    pub cargo_opts: CargoOpts,
+}
+
+#[derive(Debug, StructOpt, Clone, Copy, Default)]
+pub struct CrateVerifyColumns {
+    #[structopt(long = "--show-digest")]
+    /// Show crate content digest
+    pub show_digest: Option<bool>,
+
+    #[structopt(long = "--show-leftpad-index")]
+    /// Show crate leftpad index (recent downloads / loc)
+    pub show_leftpad_index: Option<bool>,
+
+    #[structopt(long = "--show-downloads")]
+    /// Show crate download counts
+    pub show_downloads: Option<bool>,
+
+    #[structopt(long = "--show-owners")]
+    /// Show crate owners counts
+    pub show_owners: Option<bool>,
+
+    #[structopt(long = "--show-latest-trusted")]
+    /// Show latest trusted version
+    pub show_latest_trusted: Option<bool>,
+
+    #[structopt(long = "--show-reviews")]
+    /// Show reviews count
+    pub show_reviews: Option<bool>,
+
+    #[structopt(long = "--show-loc")]
+    /// Show Lines of Code
+    pub show_loc: Option<bool>,
+
+    #[structopt(long = "--show-issues")]
+    /// Show count of issues reported
+    pub show_issues: Option<bool>,
+
+    #[structopt(long = "--show-geiger")]
+    /// Show geiger (unsafe lines) count
+    pub show_geiger: Option<bool>,
+
+    #[structopt(long = "--show-flags")]
+    /// Show crate flags
+    pub show_flags: Option<bool>,
+
+    #[structopt(long = "--show-all")]
+    /// Show all
+    pub show_all: bool,
+}
+
+macro_rules! show_x {
+    ($name:ident, $default:expr) => {
+        pub fn $name(self) -> bool {
+            self.show_all || self.$name.unwrap_or($default)
+        }
+    }
+}
+
+impl CrateVerifyColumns {
+    pub fn any_selected(self) -> bool {
+        self.show_digest.is_some()
+            || self.show_leftpad_index.is_some()
+            || self.show_downloads.is_some()
+            || self.show_owners.is_some()
+            || self.show_reviews.is_some()
+            || self.show_latest_trusted.is_some()
+            || self.show_flags.is_some()
+            || self.show_issues.is_some()
+            || self.show_loc.is_some()
+            || self.show_geiger.is_some()
+            || self.show_all
+    }
+
+    show_x!(show_digest, false);
+    show_x!(show_reviews, false);
+    show_x!(show_leftpad_index, false);
+    show_x!(show_downloads, false);
+    show_x!(show_latest_trusted, true);
+    show_x!(show_flags, true);
+    show_x!(show_owners, false);
+    show_x!(show_issues, true);
+    show_x!(show_loc, false);
+    show_x!(show_geiger, false);
+}
+
+#[derive(Debug, StructOpt, Clone, Default)]
+pub struct CrateVerify {
+    #[structopt(flatten)]
+    pub common: CrateVerifyCommon,
+
+    #[structopt(flatten)]
+    pub columns: CrateVerifyColumns,
+
+    #[structopt(long = "interactive", short = "i")]
+    pub interactive: bool,
 
     #[structopt(long = "skip-verified")]
+    /// Display only crates not passing the verification
     pub skip_verified: bool,
 
     #[structopt(long = "skip-known-owners")]
+    /// Skip crate from known owners (use `edit known` to edit the list)
     pub skip_known_owners: bool,
+
+    #[structopt(long = "skip-indirect")]
+    /// Skip dependencies that are not direct
+    pub skip_indirect: bool,
+
+    #[structopt(long = "recursive")]
+    /// Calculate recursive metrics for your packages
+    pub recursive: bool,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Verify {
-    /// Verify dependencies
-    #[structopt(name = "deps")]
-    Deps(VerifyDeps),
-}
-
-#[derive(Debug, StructOpt, Clone)]
-pub struct Trust {
+pub struct IdTrust {
     /// Public IDs to create Trust Proof for
     pub pub_ids: Vec<String>,
 
@@ -88,86 +307,132 @@ pub struct Trust {
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct FetchUrl {
+pub struct RepoFetchUrl {
     /// URL to public proof repository
     pub url: String,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Fetch {
-    #[structopt(name = "trusted")]
+pub enum RepoFetch {
+    #[structopt(name = "trusted", alias = "t")]
     /// Fetch updates from trusted Ids
-    Trusted(TrustParams),
+    Trusted {
+        #[structopt(flatten)]
+        distance_params: TrustDistanceParams,
 
-    #[structopt(name = "url")]
+        #[structopt(long = "for-id")]
+        for_id: Option<String>,
+    },
+
+    #[structopt(name = "url", alias = "u")]
     /// Fetch from a single public proof repository
-    Url(FetchUrl),
+    Url(RepoFetchUrl),
 
-    #[structopt(name = "all")]
+    #[structopt(name = "all", alias = "a")]
     /// Fetch all previously retrieved public proof repositories
     All,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum QueryId {
+pub enum IdQuery {
     /// Show current Id
-    #[structopt(name = "current")]
-    Current,
+    #[structopt(name = "current", alias = "c")]
+    Current {
+        #[structopt(flatten)]
+        trust_params: TrustDistanceParams,
+    },
 
     /// Show all known Ids
-    #[structopt(name = "all")]
-    All,
+    #[structopt(name = "all", alias = "a")]
+    All {
+        #[structopt(flatten)]
+        trust_params: TrustDistanceParams,
+
+        #[structopt(long = "for-id")]
+        for_id: Option<String>,
+    },
 
     /// Show own Ids
-    #[structopt(name = "own")]
-    Own,
+    #[structopt(name = "own", alias = "o")]
+    Own {
+        #[structopt(flatten)]
+        trust_params: TrustDistanceParams,
+    },
 
     /// List trusted ids
-    #[structopt(name = "trusted")]
+    #[structopt(name = "trusted", alias = "t")]
     Trusted {
         #[structopt(flatten)]
-        trust_params: TrustParams,
+        trust_params: TrustDistanceParams,
+
+        #[structopt(long = "for-id")]
+        for_id: Option<String>,
+
+        #[structopt(flatten)]
+        trust_level: TrustLevelRequirements,
     },
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct QueryReview {
+pub struct RepoQueryReview {
     #[structopt(flatten)]
     pub crate_: CrateSelector,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Query {
-    /// Query Ids
-    #[structopt(name = "id")]
-    Id(QueryId),
+pub struct RepoQueryAdvisory {
+    #[structopt(flatten)]
+    pub crate_: CrateSelector,
+}
 
+#[derive(Debug, StructOpt, Clone)]
+pub struct RepoQueryIssue {
+    #[structopt(flatten)]
+    pub crate_: CrateSelector,
+
+    #[structopt(flatten)]
+    pub trust_params: TrustDistanceParams,
+
+    /// Minimum trust level of the reviewers for reviews
+    #[structopt(long = "trust", default_value = "none")]
+    pub trust_level: crev_data::Level,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+pub struct CrateDir {
+    #[structopt(flatten)]
+    pub common: ReviewOrGotoCommon,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+pub enum RepoQuery {
     /// Query reviews
-    #[structopt(name = "review")]
-    Review(QueryReview),
+    #[structopt(name = "review", alias = "r")]
+    Review(RepoQueryReview),
+
+    /// Query applicable advisories
+    #[structopt(name = "advisory", alias = "a")]
+    Advisory(RepoQueryAdvisory),
+
+    /// Query applicable issues
+    #[structopt(name = "issue", alias = "i")]
+    Issue(RepoQueryIssue),
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Switch {
-    /// Change current Id
-    #[structopt(name = "id")]
-    Id(SwitchId),
-}
-
-#[derive(Debug, StructOpt, Clone)]
-pub enum Edit {
+pub enum RepoEdit {
     /// Edit your README.md file
-    #[structopt(name = "readme")]
+    #[structopt(name = "readme", alias = "r")]
     Readme,
 
     /// Edit your KNOWN_CRATE_OWNERS.md file
-    #[structopt(name = "known")]
+    #[structopt(name = "known", alias = "k")]
     Known,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct Git {
-    /// Arguments to git command
+pub struct RepoGit {
+    /// Arguments to the `git` command
     #[structopt(parse(from_os_str))]
     pub args: Vec<OsString>,
 }
@@ -176,10 +441,20 @@ pub struct Git {
 pub struct ReviewOrGotoCommon {
     #[structopt(flatten)]
     pub crate_: CrateSelector,
+}
 
-    /// This crate is not neccesarily a dependency of the current cargo project
-    #[structopt(long = "independent")]
-    pub independent: bool,
+#[derive(Debug, StructOpt, Clone)]
+pub struct CrateOpen {
+    /// Shell command to execute with crate directory as an argument. Eg. "code --wait -n" for VSCode
+    #[structopt(long = "cmd")]
+    pub cmd: Option<String>,
+
+    /// Save the `--cmd` argument to be used a default in the future
+    #[structopt(long = "cmd-save")]
+    pub cmd_save: bool,
+
+    #[structopt(flatten)]
+    pub common: ReviewOrGotoCommon,
 }
 
 #[derive(Debug, StructOpt, Clone)]
@@ -196,110 +471,286 @@ pub struct CommonProofCreate {
     #[structopt(long = "print-signed")]
     pub print_signed: bool,
 
-    /// Print signed proof content on stdout
+    /// Don't store the proof
     #[structopt(long = "no-store")]
     pub no_store: bool,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct Review {
+pub struct CrateReview {
     #[structopt(flatten)]
     pub common: ReviewOrGotoCommon,
 
     #[structopt(flatten)]
     pub common_proof_create: CommonProofCreate,
+
+    /// Create advisory urging to upgrade to a safe version
+    #[structopt(long = "advisory")]
+    pub advisory: bool,
+
+    /// This release contains advisory (important fix)
+    #[structopt(long = "affected")]
+    pub affected: Option<crev_data::proof::review::package::VersionRange>,
+
+    /// Severity of bug/security issue [none low medium high]
+    #[structopt(long = "severity")]
+    pub severity: Option<Level>,
+
+    /// Flag the crate as buggy/low-quality/dangerous
+    #[structopt(long = "issue")]
+    pub issue: bool,
+
+    #[structopt(long = "skip-activity-check")]
+    pub skip_activity_check: bool,
+
+    #[structopt(long = "diff")]
+    #[allow(clippy::option_option)]
+    pub diff: Option<Option<semver::Version>>,
+
+    #[structopt(flatten)]
+    pub cargo_opts: CargoOpts,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdviseCommon {
+    /// This release contains advisory (important fix)
+    pub affected: crev_data::proof::review::package::VersionRange,
+    pub severity: Level,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct ExportId {
+pub struct CrateSearch {
+    /// Number of results
+    #[structopt(long = "count", default_value = "10")]
+    pub count: usize,
+    /// Query to use
+    pub query: String,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+pub struct IdExport {
     pub id: Option<String>,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Export {
-    #[structopt(name = "id")]
-    Id(ExportId),
+pub struct RepoImport {
+    /// Reset proof date to current date
+    #[structopt(long = "reset-date")]
+    pub reset_date: bool,
+
+    #[structopt(flatten)]
+    pub common: CommonProofCreate,
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub enum Import {
-    #[structopt(name = "id")]
-    Id,
-}
-#[derive(Debug, StructOpt, Clone)]
-pub enum Command {
-    /// Create an Id, ...
-    #[structopt(name = "new")]
-    New(New),
+pub enum Id {
+    /// Create a new Id
+    #[structopt(name = "new", alias = "n")]
+    New(IdNew),
 
-    /// Switch current Id, ...
-    #[structopt(name = "switch")]
-    Switch(Switch),
+    /// Export your own Id
+    #[structopt(name = "export", alias = "e")]
+    Export(IdExport),
 
-    /// Edit README.md of the current Id, ...
-    #[structopt(name = "edit")]
-    Edit(Edit),
+    /// Import an Id as your own
+    #[structopt(name = "import", alias = "i")]
+    Import,
 
-    /// Verify dependencies
-    #[structopt(name = "verify")]
-    Verify(Verify),
+    /// Show your current Id
+    #[structopt(name = "current", alias = "c")]
+    Current,
 
-    /// Review a crate
-    #[structopt(name = "review")]
-    Review(Review),
-
-    /// Flag a crate as buggy/low-quality/dangerous
-    #[structopt(name = "flag")]
-    Flag(Review),
-
-    /// Query Ids, packages, reviews...
-    #[structopt(name = "query")]
-    Query(Query),
+    /// Change current Id
+    #[structopt(name = "switch", alias = "s")]
+    Switch(IdSwitch),
 
     /// Trust an Id
-    #[structopt(name = "trust")]
-    Trust(Trust),
+    #[structopt(name = "trust", alias = "t")]
+    Trust(IdTrust),
+
+    /// Untrust (remove) trust
+    #[structopt(name = "untrust", alias = "u")]
+    Untrust(IdTrust),
 
     /// Distrust an Id
-    #[structopt(name = "distrust")]
-    Distrust(Trust),
+    #[structopt(name = "distrust", alias = "d")]
+    Distrust(IdTrust),
 
-    /// Fetch proofs from external sources
-    #[structopt(name = "fetch")]
-    Fetch(Fetch),
+    /// Query Ids
+    #[structopt(name = "query", alias = "q")]
+    Query(IdQuery),
+}
 
-    /// Run raw git commands in the local proof repository
-    #[structopt(name = "git")]
-    #[structopt(raw(setting = "structopt::clap::AppSettings::TrailingVarArg"))]
-    Git(Git),
-
-    /// Push local changes to the public proof repository (alias to `git push HEAD`)
-    #[structopt(name = "push")]
-    Push,
-
-    /// Commit and Push local changes to the public proof repository (alias to `git commit -a && git push HEAD`)
-    #[structopt(name = "publish")]
-    Publish,
-
-    /// Pull changes from the public proof repository (alias to `git pull`)
-    #[structopt(name = "pull")]
-    Pull,
-
+#[derive(Debug, StructOpt, Clone)]
+pub enum Crate {
     /// Start a shell in source directory of a crate under review
-    #[structopt(name = "goto")]
+    #[structopt(name = "goto", alias = "g")]
     Goto(ReviewOrGotoCommon),
 
+    /// Open source code of a crate
+    #[structopt(name = "open", alias = "o")]
+    Open(CrateOpen),
+
     /// Clean a crate source code (eg. after review)
-    #[structopt(name = "clean")]
+    #[structopt(name = "clean", alias = "c")]
     Clean(ReviewOrGotoCommon),
 
-    /// Export an id, ...
-    #[structopt(name = "export")]
-    Export(Export),
+    /// Diff between two versions of a package
+    #[structopt(name = "diff", alias = "d")]
+    #[structopt(raw(setting = "structopt::clap::AppSettings::TrailingVarArg"))]
+    #[structopt(raw(setting = "structopt::clap::AppSettings::AllowLeadingHyphen"))]
+    Diff(Diff),
 
-    /// Import an Id, ...
-    #[structopt(name = "import")]
-    Import(Import),
+    /// Query source directory of a package
+    #[structopt(name = "dir")]
+    Dir(CrateDir),
+
+    /// Verify dependencies
+    #[structopt(
+        name = "verify",
+        alias = "v",
+        after_help = r"This will show the following information:
+
+Recursive mode will will calculate most metrics for the crate together with all its dependencies.
+
+- trust      - Trust check result: `pass` for trusted, `none` for lacking reviews, `flagged` or `dangerous` for crates with problem reports.
+- reviews    - Number of reviews for the specific version and for all available versions (total)
+- downloads  - Download counts from crates.io for the specific version and all versions
+- owner
+  - In non-recursive mode: Owner counts from crates.io (known/all)
+  - In recursive mode:
+    - Total number of owners from crates.io
+    - Total number of owner groups ignoring subsets
+- issues     - Number of issues repored (from trusted sources/all)
+- lines      - Lines of Rust code
+- geiger     - Geiger score: number of `unsafe` lines
+- flgs       - Flags for specific types of packages
+  - CB         - Custom Build
+  - UM         - Crate Unmaintained
+- name       - Crate name
+- version    - Crate version
+- latest_t   - Latest trusted version"
+    )]
+    Verify {
+        #[structopt(flatten)]
+        opts: CrateVerify,
+
+        #[structopt(flatten)]
+        crate_: CrateSelector,
+    },
+
+    /// Most valuable players (reviewers)
+    #[structopt(name = "mvp", alias = "m")]
+    Mvp {
+        #[structopt(flatten)]
+        opts: CrateVerifyCommon,
+        #[structopt(flatten)]
+        crate_: CrateSelector,
+    },
+
+    /// Review a crate (code review, security advisory, flag issues)
+    #[structopt(name = "review", alias = "r")]
+    Review(CrateReview),
+
+    /// Untrust (remove) trust
+    #[structopt(name = "unreview", alias = "u")]
+    Unreview(CrateReview),
+
+    /// Search crates on crates.io sorting by review count
+    #[structopt(name = "search", alias = "s")]
+    Search(CrateSearch),
+
+    /// Display rich info about the given crate
+    #[structopt(name = "info", alias = "i")]
+    Info {
+        #[structopt(flatten)]
+        opts: CrateVerifyCommon,
+        #[structopt(flatten)]
+        crate_: CrateSelector,
+    },
+}
+
+#[derive(Debug, StructOpt, Clone)]
+pub enum Config {
+    /// Edit the config file
+    #[structopt(name = "edit", alias = "e")]
+    Edit,
+
+    /// Completions
+    #[structopt(name = "completions")]
+    Completions {
+        #[structopt(long = "shell")]
+        shell: Option<String>,
+    },
+
+    /// Print the dir containing config files
+    #[structopt(name = "dir", alias = "d")]
+    Dir,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+/// Local Proof Repository
+pub enum Repo {
+    /// Publish to remote repository
+    #[structopt(name = "publish", alias = "p")]
+    Publish,
+
+    /// Update data from online sources (proof repositories, crates.io)
+    #[structopt(name = "update", alias = "pull")]
+    Update(Update),
+
+    /// Run raw git commands in the local proof repository
+    #[structopt(name = "git", alias = "g")]
+    #[structopt(raw(setting = "structopt::clap::AppSettings::TrailingVarArg"))]
+    #[structopt(raw(setting = "structopt::clap::AppSettings::AllowLeadingHyphen"))]
+    Git(RepoGit),
+
+    /// Edit README.md of the current Id, ...
+    #[structopt(name = "edit", alias = "e")]
+    Edit(RepoEdit),
+
+    /// Import proofs
+    #[structopt(name = "import", alias = "i")]
+    Import(RepoImport),
+
+    /*
+    /// Export proofs
+    #[structopt(name = "export")]
+    Export,
+    */
+    /// Query proofs
+    #[structopt(name = "query", alias = "q")]
+    Query(RepoQuery),
+
+    /// Fetch proofs from external sources
+    #[structopt(name = "fetch", alias = "f")]
+    Fetch(RepoFetch),
+
+    /// Print the dir containing local copy of the proof repository
+    #[structopt(name = "dir", alias = "d")]
+    Dir,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+#[structopt(
+    after_help = "Join Matrix channel for more help: https://matrix.to/#/!uBhYhtcoNlyEbzfYAW:matrix.org"
+)]
+pub enum Command {
+    /// Id (own and of other users)
+    #[structopt(name = "id", alias = "i")]
+    Id(Id),
+
+    /// Crate related operations (review, verify...)
+    #[structopt(name = "crate", alias = "c")]
+    Crate(Crate),
+
+    /// Proof Repository - store of proofs
+    #[structopt(name = "repo", alias = "r")]
+    Repo(Repo),
+
+    /// Config
+    #[structopt(name = "config", alias = "co")]
+    Config(Config),
 }
 
 /// Cargo will pass the name of the `cargo-<tool>`
@@ -307,11 +758,19 @@ pub enum Command {
 #[derive(Debug, StructOpt, Clone)]
 pub enum MainCommand {
     #[structopt(name = "crev")]
+    #[structopt(
+        after_help = r#"Join Matrix channel for more help at https://matrix.to/#/!uBhYhtcoNlyEbzfYAW:matrix.org
+Read user documentation at https://docs.rs/crate/cargo-crev
+        "#
+    )]
     Crev(Command),
 }
 
 #[derive(Debug, StructOpt, Clone)]
-#[structopt(name = "crev", about = "Distributed code review system")]
+#[structopt(about = "Distributed code review system")]
+// without this the name will be `cargo-crev-crev` because the `crev` main command will be automatically appended
+#[structopt(bin_name = "cargo")]
+#[structopt(raw(global_setting = "structopt::clap::AppSettings::ColoredHelp"))]
 pub struct Opts {
     #[structopt(subcommand)]
     pub command: MainCommand,

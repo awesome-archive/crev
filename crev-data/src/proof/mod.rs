@@ -1,262 +1,204 @@
 //! Some common stuff for both Review and Trust Proofs
 
-use crate::Url;
 use chrono::{self, prelude::*};
 use crev_common;
-use std::{default, fmt, fs, io, mem, path::Path};
+use failure::bail;
+use std::{
+    default, fmt,
+    io::{self, BufRead},
+    mem,
+};
 
+pub mod content;
 pub mod package_info;
 pub mod review;
 pub mod revision;
 pub mod trust;
 
+pub use self::review::{Code as CodeReview, Package as PackageReview};
+
 pub use self::{package_info::*, revision::*, trust::*};
+pub use crate::proof::content::{
+    Common, CommonOps, Content, ContentDeserialize, ContentExt, ContentWithDraft, Draft, WithReview,
+};
+pub use review::*;
 
 use crate::Result;
 
-pub trait ContentCommon {
-    fn date(&self) -> &chrono::DateTime<FixedOffset>;
-    fn author(&self) -> &crate::PubId;
+const MAX_PROOF_BODY_LENGTH: usize = 32_000;
 
-    fn date_utc(&self) -> chrono::DateTime<Utc> {
-        self.date().with_timezone(&Utc)
-    }
-
-    fn author_id(&self) -> crate::Id {
-        self.author().id.clone()
-    }
-
-    fn author_url(&self) -> Url {
-        self.author().url.clone()
-    }
-
-    fn draft_title(&self) -> String;
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum ProofType {
-    Code,
-    Package,
-    Trust,
-}
-
-impl ProofType {
-    fn begin_block(&self) -> &'static str {
-        match self {
-            ProofType::Code => review::Code::BEGIN_BLOCK,
-            ProofType::Package => review::Package::BEGIN_BLOCK,
-            ProofType::Trust => Trust::BEGIN_BLOCK,
-        }
-    }
-    fn begin_signature(&self) -> &'static str {
-        match self {
-            ProofType::Code => review::Code::BEGIN_SIGNATURE,
-            ProofType::Package => review::Package::BEGIN_SIGNATURE,
-            ProofType::Trust => Trust::BEGIN_SIGNATURE,
-        }
-    }
-    fn end_block(&self) -> &'static str {
-        match self {
-            ProofType::Code => review::Code::END_BLOCK,
-            ProofType::Package => review::Package::END_BLOCK,
-            ProofType::Trust => Trust::END_BLOCK,
-        }
-    }
-}
+pub type Date = chrono::DateTime<FixedOffset>;
+pub type DateUtc = chrono::DateTime<Utc>;
 
 /// Serialized Proof
 ///
 /// A signed proof containing some signed `Content`
 #[derive(Debug, Clone)]
-pub(crate) struct Serialized {
-    /// Serialized content
-    pub body: String,
-    /// Signature over the body
-    pub signature: String,
-    /// Type of the `body` (`Content`)
-    pub type_: ProofType,
-}
-
-/// Content is an enumerator of possible proof contents
-#[derive(Debug, Clone)]
-pub enum Content {
-    Trust(Trust),
-    Package(review::Package),
-    Code(review::Code),
-}
-
-impl fmt::Display for Content {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use self::Content::*;
-        match self {
-            Trust(trust) => trust.fmt(f),
-            Code(code) => code.fmt(f),
-            Package(package) => package.fmt(f),
-        }
-    }
-}
-
-impl From<review::Code> for Content {
-    fn from(review: review::Code) -> Self {
-        Content::Code(review)
-    }
-}
-
-impl From<review::Package> for Content {
-    fn from(review: review::Package) -> Self {
-        Content::Package(review)
-    }
-}
-
-impl From<Trust> for Content {
-    fn from(review: Trust) -> Self {
-        Content::Trust(review)
-    }
-}
-
-impl Content {
-    pub fn draft_title(&self) -> String {
-        use self::Content::*;
-        match self {
-            Trust(trust) => trust.draft_title(),
-            Code(review) => review.draft_title(),
-            Package(review) => review.draft_title(),
-        }
-    }
-    pub fn parse(s: &str, type_: ProofType) -> Result<Content> {
-        Ok(match type_ {
-            ProofType::Code => Content::Code(review::Code::parse(&s)?),
-            ProofType::Package => Content::Package(review::Package::parse(&s)?),
-            ProofType::Trust => Content::Trust(Trust::parse(&s)?),
-        })
-    }
-
-    pub fn parse_draft(original_proof: &Content, s: &str) -> Result<Content> {
-        Ok(match original_proof {
-            Content::Code(code) => {
-                Content::Code(code.apply_draft(review::CodeDraft::parse(&s)?.into()))
-            }
-            Content::Package(package) => {
-                Content::Package(package.apply_draft(review::PackageDraft::parse(&s)?.into()))
-            }
-            Content::Trust(trust) => {
-                Content::Trust(trust.apply_draft(TrustDraft::parse(&s)?.into()))
-            }
-        })
-    }
-    pub fn sign_by(&self, id: &crate::id::OwnId) -> Result<Proof> {
-        let body = self.to_string();
-        let signature = id.sign(&body.as_bytes());
-        Ok(Proof {
-            digest: crev_common::blake2b256sum(&body.as_bytes()),
-            body: body,
-            signature: crev_common::base64_encode(&signature),
-            content: self.clone(),
-        })
-    }
-
-    pub fn proof_type(&self) -> ProofType {
-        use self::Content::*;
-        match self {
-            Trust(_trust) => ProofType::Trust,
-            Code(_review) => ProofType::Code,
-            Package(_review) => ProofType::Package,
-        }
-    }
-
-    pub fn date(&self) -> &chrono::DateTime<FixedOffset> {
-        use self::Content::*;
-        match self {
-            Trust(trust) => trust.date(),
-            Code(review) => review.date(),
-            Package(review) => review.date(),
-        }
-    }
-
-    pub fn author_id(&self) -> crate::Id {
-        use self::Content::*;
-        match self {
-            Trust(trust) => trust.author_id(),
-            Code(review) => review.author_id(),
-            Package(review) => review.author_id(),
-        }
-    }
-
-    pub fn author_url(&self) -> Url {
-        use self::Content::*;
-        match self {
-            Trust(trust) => trust.author_url(),
-            Code(review) => review.author_url(),
-            Package(review) => review.author_url(),
-        }
-    }
-
-    pub fn to_draft_string(&self) -> String {
-        use self::Content::*;
-        match self.clone() {
-            Trust(trust) => format!("{}", TrustDraft::from(trust)),
-            Code(review) => format!("{}", review::CodeDraft::from(review)),
-            Package(review) => format!("{}", review::PackageDraft::from(review)),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-/// A `Proof` with it's content parsed and ready.
 pub struct Proof {
-    pub body: String,
-    pub signature: String,
-    pub digest: Vec<u8>,
-    pub content: Content,
+    /// Serialized content
+    body: String,
+
+    /// Signature over the body
+    signature: String,
+
+    /// Common informations that should be in any  proof
+    common_content: Common,
+
+    /// Digest
+    digest: Vec<u8>,
 }
 
-impl fmt::Display for Serialized {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.type_.begin_block())?;
-        f.write_str("\n")?;
-        f.write_str(&self.body)?;
-        f.write_str(self.type_.begin_signature())?;
-        f.write_str("\n")?;
-        f.write_str(&self.signature)?;
-        f.write_str("\n")?;
-        f.write_str(self.type_.end_block())?;
-        f.write_str("\n")?;
+impl Proof {
+    pub fn from_parts(body: String, signature: String) -> Result<Self> {
+        let common_content: Common = serde_yaml::from_str(&body)?;
+        if common_content.kind.is_none() {
+            bail!("`kind` field missing");
+        }
+        let digest = crev_common::blake2b256sum(&body.as_bytes());
+        let signature = signature.trim().to_owned();
+        Ok(Self {
+            body,
+            signature,
+            common_content,
+            digest,
+        })
+    }
 
-        Ok(())
+    pub fn from_legacy_parts(body: String, signature: String, type_name: String) -> Result<Self> {
+        #[allow(deprecated)]
+        let mut legacy_common_content: content::Common = serde_yaml::from_str(&body)?;
+        if let Some(kind) = legacy_common_content.kind {
+            bail!("Unexpected `kind` value in a legacy format: {}", kind);
+        }
+
+        legacy_common_content.kind = Some(type_name);
+        let digest = crev_common::blake2b256sum(&body.as_bytes());
+        let signature = signature.trim().to_owned();
+        Ok(Self {
+            body,
+            signature,
+            common_content: legacy_common_content,
+            digest,
+        })
+    }
+    pub fn body(&self) -> &str {
+        self.body.as_str()
+    }
+
+    pub fn signature(&self) -> &str {
+        self.signature.as_str()
+    }
+
+    pub fn digest(&self) -> &[u8] {
+        self.digest.as_slice()
+    }
+
+    pub fn parse_content<T: ContentDeserialize>(&self) -> Result<T> {
+        Ok(T::deserialize_from(self.body.as_bytes())?)
+    }
+}
+
+impl CommonOps for Proof {
+    fn common(&self) -> &Common {
+        &self.common_content
+    }
+}
+
+const PROOF_START: &str = "----- BEGIN CREV PROOF -----";
+const PROOF_SIGNATURE: &str = "----- SIGN CREV PROOF -----";
+const PROOF_END: &str = "----- END CREV PROOF -----";
+
+const LEGACY_PROOF_START_PREFIX: &str = "-----BEGIN CREV ";
+const LEGACY_PROOF_START_SUFFIX: &str = "-----";
+// There was a bug ... :D ... https://github.com/dpc/crev-proofs/blob/3ea7e440f1ed84f5a333741e71a90e2067fe9cfc/FYlr8YoYGVvDwHQxqEIs89reKKDy-oWisoO0qXXEfHE/trust/2019-10-GkN7aw.proof.crev#L1
+const LEGACY_PROOF_START_SUFFIX_ALT: &str = " -----";
+const LEGACY_PROOF_SIGNATURE_PREFIX: &str = "-----BEGIN CREV ";
+const LEGACY_PROOF_SIGNATURE_SUFFIX: &str = " SIGNATURE-----";
+const LEGACY_PROOF_END_PREFIX: &str = "-----END CREV ";
+const LEGACY_PROOF_END_SUFFIX: &str = "-----";
+
+fn is_start_line(line: &str) -> bool {
+    line.trim() == PROOF_START
+}
+
+fn is_signature_line(line: &str) -> bool {
+    line.trim() == PROOF_SIGNATURE
+}
+
+fn is_end_line(line: &str) -> bool {
+    line.trim() == PROOF_END
+}
+
+fn is_legacy_start_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with(LEGACY_PROOF_START_PREFIX)
+        && trimmed.ends_with(LEGACY_PROOF_START_SUFFIX_ALT)
+    {
+        let type_name = &trimmed[LEGACY_PROOF_START_PREFIX.len()..];
+        let type_name = &type_name[..(type_name.len() - LEGACY_PROOF_START_SUFFIX_ALT.len())];
+
+        Some(type_name.to_lowercase())
+    } else if trimmed.starts_with(LEGACY_PROOF_START_PREFIX)
+        && trimmed.ends_with(LEGACY_PROOF_START_SUFFIX)
+    {
+        let type_name = &trimmed[LEGACY_PROOF_START_PREFIX.len()..];
+        let type_name = &type_name[..(type_name.len() - LEGACY_PROOF_START_SUFFIX.len())];
+
+        Some(type_name.to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn is_legacy_signature_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with(LEGACY_PROOF_SIGNATURE_PREFIX)
+        && trimmed.ends_with(LEGACY_PROOF_SIGNATURE_SUFFIX)
+    {
+        let type_name = &trimmed[LEGACY_PROOF_SIGNATURE_PREFIX.len()..];
+        let type_name = &type_name[..(type_name.len() - LEGACY_PROOF_SIGNATURE_SUFFIX.len())];
+
+        Some(type_name.to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn is_legacy_end_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with(LEGACY_PROOF_END_PREFIX) && trimmed.ends_with(LEGACY_PROOF_END_SUFFIX) {
+        let type_name = &trimmed[LEGACY_PROOF_END_PREFIX.len()..];
+        let type_name = &type_name[..(type_name.len() - LEGACY_PROOF_END_SUFFIX.len())];
+
+        Some(type_name.to_lowercase())
+    } else {
+        None
     }
 }
 
 impl fmt::Display for Proof {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.content.proof_type().begin_block())?;
+        f.write_str(PROOF_START)?;
         f.write_str("\n")?;
         f.write_str(&self.body)?;
-        f.write_str(self.content.proof_type().begin_signature())?;
+        f.write_str(PROOF_SIGNATURE)?;
         f.write_str("\n")?;
         f.write_str(&self.signature)?;
         f.write_str("\n")?;
-        f.write_str(self.content.proof_type().end_block())?;
+        f.write_str(PROOF_END)?;
         f.write_str("\n")?;
 
         Ok(())
     }
 }
 
-impl Serialized {
-    pub fn to_parsed(&self) -> Result<Proof> {
-        Ok(Proof {
-            body: self.body.clone(),
-            signature: self.signature.clone(),
-            digest: crev_common::blake2b256sum(&self.body.as_bytes()),
-            content: match self.type_ {
-                ProofType::Code => Content::Code(review::Code::parse(&self.body)?),
-                ProofType::Package => Content::Package(review::Package::parse(&self.body)?),
-                ProofType::Trust => Content::Trust(Trust::parse(&self.body)?),
-            },
-        })
-    }
+impl Proof {
+    pub fn parse_from(reader: impl io::Read) -> Result<Vec<Self>> {
+        let reader = std::io::BufReader::new(reader);
 
-    pub fn parse(reader: impl io::BufRead) -> Result<Vec<Self>> {
         #[derive(PartialEq, Eq)]
         enum Stage {
             None,
@@ -274,8 +216,8 @@ impl Serialized {
             stage: Stage,
             body: String,
             signature: String,
-            type_: ProofType,
-            proofs: Vec<Serialized>,
+            type_name: Option<String>,
+            proofs: Vec<Proof>,
         }
 
         impl default::Default for State {
@@ -284,7 +226,7 @@ impl Serialized {
                     stage: Default::default(),
                     body: Default::default(),
                     signature: Default::default(),
-                    type_: ProofType::Trust, // whatever
+                    type_name: None,
                     proofs: vec![],
                 }
             }
@@ -296,42 +238,69 @@ impl Serialized {
                     Stage::None => {
                         let line = line.trim();
                         if line.is_empty() {
-                        } else if line == ProofType::Code.begin_block() {
-                            self.type_ = ProofType::Code;
+                        } else if let Some(type_name) = is_legacy_start_line(line) {
+                            self.type_name = Some(type_name);
                             self.stage = Stage::Body;
-                        } else if line == ProofType::Trust.begin_block() {
-                            self.type_ = ProofType::Trust;
-                            self.stage = Stage::Body;
-                        } else if line == ProofType::Package.begin_block() {
-                            self.type_ = ProofType::Package;
+                        } else if is_start_line(line) {
+                            assert!(self.type_name.is_none());
                             self.stage = Stage::Body;
                         } else {
                             bail!("Parsing error when looking for start of code review proof");
                         }
                     }
                     Stage::Body => {
-                        if line.trim() == self.type_.begin_signature() {
-                            self.stage = Stage::Signature;
+                        if self.type_name.is_some() {
+                            if let Some(type_name) = is_legacy_signature_line(line) {
+                                if Some(type_name) != self.type_name {
+                                    bail!("Parsing error: type name mismatch in the signature");
+                                }
+                                self.stage = Stage::Signature;
+                            } else {
+                                self.body += line;
+                                self.body += "\n";
+                            }
                         } else {
-                            self.body += line;
-                            self.body += "\n";
+                            if is_signature_line(line) {
+                                self.stage = Stage::Signature;
+                            } else {
+                                self.body += line;
+                                self.body += "\n";
+                            }
                         }
-                        if self.body.len() > 16_000 {
+                        if self.body.len() > MAX_PROOF_BODY_LENGTH {
                             bail!("Proof body too long");
                         }
                     }
                     Stage::Signature => {
-                        if line.trim() == self.type_.end_block() {
-                            self.stage = Stage::None;
-                            self.proofs.push(Serialized {
-                                body: mem::replace(&mut self.body, String::new()),
-                                signature: mem::replace(&mut self.signature, String::new()),
-                                type_: self.type_,
-                            });
+                        if self.type_name.is_some() {
+                            if let Some(type_name) = is_legacy_end_line(line) {
+                                if Some(&type_name) != self.type_name.as_ref() {
+                                    bail!("Parsing error: type name mismatch in the footer");
+                                }
+                                self.stage = Stage::None;
+                                self.type_name = None;
+                                self.proofs.push(Proof::from_legacy_parts(
+                                    mem::replace(&mut self.body, String::new()),
+                                    mem::replace(&mut self.signature, String::new()),
+                                    type_name,
+                                )?);
+                            } else {
+                                self.signature += line;
+                                self.signature += "\n";
+                            }
                         } else {
-                            self.signature += line;
-                            self.signature += "\n";
+                            if is_end_line(line) {
+                                self.stage = Stage::None;
+                                self.proofs.push(Proof::from_parts(
+                                    mem::replace(&mut self.body, String::new()),
+                                    mem::replace(&mut self.signature, String::new()),
+                                )?);
+                            } else {
+                                self.signature += line;
+                                self.signature += "\n";
+                            }
                         }
+
                         if self.signature.len() > 2000 {
                             bail!("Signature too long");
                         }
@@ -340,7 +309,7 @@ impl Serialized {
                 Ok(())
             }
 
-            fn finish(self) -> Result<Vec<Serialized>> {
+            fn finish(self) -> Result<Vec<Proof>> {
                 if self.stage != Stage::None {
                     bail!("Unexpected EOF while parsing");
                 }
@@ -356,28 +325,9 @@ impl Serialized {
 
         state.finish()
     }
-}
-
-impl Proof {
-    pub fn parse_from(path: &Path) -> Result<Vec<Self>> {
-        let file = fs::File::open(path)?;
-        Self::parse(io::BufReader::new(file))
-    }
-
-    pub fn parse(reader: impl io::BufRead) -> Result<Vec<Self>> {
-        let mut v = vec![];
-        for serialized in Serialized::parse(reader)?.into_iter() {
-            v.push(serialized.to_parsed()?)
-        }
-        Ok(v)
-    }
-
-    pub fn signature(&self) -> &str {
-        self.signature.trim()
-    }
 
     pub fn verify(&self) -> Result<()> {
-        let pubkey = self.content.author_id();
+        let pubkey = &self.from().id;
         pubkey.verify_signature(self.body.as_bytes(), self.signature())?;
 
         Ok(())
